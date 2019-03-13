@@ -92,9 +92,11 @@ def create_dataloader(
     # Shuffling means that this is training dataset, so oversample
     if shuffle:
         random_oversampler = RandomOverSampler(random_state=0)
+        # Assume that label is Score, Binary, we take the binary to oversample
+        sample_index = 1 if len(labels[0]) == 2 else 0
         # Dummy X data, y is the binary label
         _, _ = random_oversampler.fit_resample(
-            torch.ones(len(features), 1), [l[1] for l in labels])
+            torch.ones(len(features), 1), [l[sample_index] for l in labels])
         # Get the indices for the sampled data
         indicies = random_oversampler.sample_indices_
         # reindex, new data is oversampled in the minority class

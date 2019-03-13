@@ -102,8 +102,6 @@ def runepoch(dataloader, model, criterion, optimizer=None, dotrain=True, poolfun
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-            else:
-                print(outputs.cpu().data)
 
     return loss_meter.value(), acc_meter.value()
 
@@ -155,10 +153,11 @@ def criterion_improver(mode):
 
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-torch.manual_seed(1)
+torch.manual_seed(200)
+np.random.seed(200)
 
 if device == 'cuda':
-    torch.cuda.manual_seed_all(1)
+    torch.cuda.manual_seed_all(200)
 
 
 def train(config='config/audio_lstm.yaml', **kwargs):
@@ -213,12 +212,12 @@ def train(config='config/audio_lstm.yaml', **kwargs):
     train_label_df.index = train_label_df.index.astype(str)
     dev_label_df.index = dev_label_df.index.astype(str)
 
+    target_type = ('PHQ8_Score', 'PHQ8_Binary')
+
     # Scores and their respective
-    train_labels = train_label_df.loc[:, [
-        'PHQ8_Score', 'PHQ8_Binary']].T.apply(tuple).to_dict()
-    dev_labels = dev_label_df.loc[:, [
-        'PHQ8_Score', 'PHQ8_Binary']].T.apply(tuple).to_dict()
-    n_labels = 2
+    train_labels = train_label_df.loc[:, target_type].T.apply(tuple).to_dict()
+    dev_labels = dev_label_df.loc[:, target_type].T.apply(tuple).to_dict()
+    n_labels = len(target_type)
 
     train_dataloader = create_dataloader(
         train_kaldi_string,
@@ -251,6 +250,7 @@ def train(config='config/audio_lstm.yaml', **kwargs):
         **config_parameters['scheduler_args'])
     criterion = getattr(losses, config_parameters['loss'])(
         **config_parameters['loss_args'])
+    criterion.to(device)
 
     trainedmodelpath = os.path.join(outputdir, 'model.th')
 
@@ -318,7 +318,46 @@ def parse_poolingfunction(poolingfunction_name='mean'):
             x.exp() * x).sum(d) / x.exp().sum(d)
     elif poolingfunction_name == 'time':  # Last timestep
         def pooling_function(x, d): return x.select(d, -1)
+
     return pooling_function
+
+
+def _extract_features_from_model(model, features, scaler=None):
+    if model.__class__.__name__ == 'LSTM':
+        fwdmodel = torch.nn.Sequential(model.net)
+    if model.__class__.__name__ == 'TCN':
+        fwdmodel = None
+    ret = {}
+    with torch.no_grad():
+        model = model.to(device)
+        for k, v in kaldi_io.read_mat_ark(features):
+            if scaler:
+                v = scaler.transform(v)
+            v = torch.from_numpy(v).to(device).unsqueeze(0)
+            out = fwdmodel(v)
+            if isinstance(out, tuple):  # LSTM output, 2 values hidden,and x
+                out = out[0]
+            ret[k] = out.cpu().squeeze().numpy()
+    return ret
+
+
+def extract_features(model_path: str, features='trainfeatures'):
+    modeldump = torch.load(model_path, lambda storage, loc: storage)
+    model_dir = os.path.dirname(model_path)
+    config_parameters = modeldump['config']
+    dev_features = config_parameters[features]
+    scaler = modeldump['scaler']
+    model = modeldump['model']
+
+    outputfile = os.path.join(model_dir, features + '.ark')
+    dev_features = parsecopyfeats(
+        dev_features, **config_parameters['feature_args'])
+
+    vectors = _extract_features_from_model(model, dev_features, scaler)
+    with open(outputfile, 'wb') as wp:
+        for key, vector in vectors.items():
+            kaldi_io.write_mat(wp, vector, key=key)
+    return outputfile
 
 
 def stats(model_path: str, outputfile: str = 'stats.txt'):
@@ -332,7 +371,6 @@ def stats(model_path: str, outputfile: str = 'stats.txt'):
     model_dir = os.path.dirname(model_path)
     config_parameters = modeldump['config']
     dev_features = config_parameters['devfeatures']
-    scaler = modeldump['scaler']
     dev_label_df = pd.read_csv(
         config_parameters['devlabels']).set_index('Participant_ID')
     dev_label_df.index = dev_label_df.index.astype(str)
@@ -340,24 +378,15 @@ def stats(model_path: str, outputfile: str = 'stats.txt'):
     dev_labels = dev_label_df.loc[:, [
         'PHQ8_Score', 'PHQ8_Binary']].T.apply(tuple).to_dict()
     outputfile = os.path.join(model_dir, outputfile)
-    kaldi_string = parsecopyfeats(
-        dev_features, **config_parameters['feature_args'])
-    pooling_function = parse_poolingfunction(
-        config_parameters['poolingfunction'])
     y_score_true, y_score_pred, y_binary_pred, y_binary_true = [], [], [], []
-    with torch.no_grad():
-        model = modeldump['model'].to(device).eval()
-        for key, feat in kaldi_io.read_mat_ark(kaldi_string):
-            feat = scaler.transform(feat)
-            feat = torch.from_numpy(feat).to(device).unsqueeze(0)
-            output = model(feat).cpu()
-            output = pooling_function(output, 1).squeeze(0)
-            score_pred, binary_pred = torch.chunk(output, 2, dim=-1)
-            y_score_pred.append(score_pred.numpy())
-            y_score_true.append(dev_labels[key][0])
-            y_binary_pred.append(torch.sigmoid(
-                binary_pred).round().numpy().astype(int))
-            y_binary_true.append(dev_labels[key][1])
+    scores = _forward_model(model_path, dev_features)
+    for key, score in scores.items():
+        score_pred, binary_pred = torch.chunk(score, 2, dim=-1)
+        y_score_pred.append(score_pred.numpy())
+        y_score_true.append(dev_labels[key][0])
+        y_binary_pred.append(torch.sigmoid(
+            binary_pred).round().numpy().astype(int))
+        y_binary_true.append(dev_labels[key][1])
 
     with open(outputfile, 'w') as wp:
         report = metrics.classification_report(
@@ -372,12 +401,33 @@ def stats(model_path: str, outputfile: str = 'stats.txt'):
         print("MAE: {:.3f}".format(mae))
 
 
+def _forward_model(model_path: str, features: str, dopooling: bool = True):
+    modeldump = torch.load(model_path, lambda storage, loc: storage)
+    scaler = modeldump['scaler']
+    config_parameters = modeldump['config']
+    pooling_function = parse_poolingfunction(
+        config_parameters['poolingfunction'])
+    kaldi_string = parsecopyfeats(
+        features, **config_parameters['feature_args'])
+    ret = {}
+    with torch.no_grad():
+        model = modeldump['model'].to(device).eval()
+        for key, feat in kaldi_io.read_mat_ark(kaldi_string):
+            feat = scaler.transform(feat)
+            feat = torch.from_numpy(feat).to(device).unsqueeze(0)
+            output = model(feat).cpu()
+            if dopooling:
+                output = pooling_function(output, 1).squeeze(0)
+            ret[key] = output
+    return ret
+
+
 def trainstats(config: str = 'config/audio_lstm.yaml', **kwargs):
     """Runs training and then prints dev stats
 
-    :config:str: TODO
-    :**kwargs: TODO
-    :returns: TODO
+    :config:str: config file
+    :**kwargs: Extra overwrite configs 
+    :returns: None
 
     """
     output_model = train(config, **kwargs)
@@ -390,4 +440,6 @@ if __name__ == '__main__':
         'train': train,
         'stats': stats,
         'trainstats': trainstats,
+        'ex': extract_features,
+        'fwd': _forward_model
     })

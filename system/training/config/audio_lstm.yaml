@@ -29,7 +29,7 @@ scaler_args:
 improvecriterion: loss # Can also be acc | loss
 saveinterval: 10 #Save every 5 epochs to see what happened
 poolingfunction: mean
-loss: DepressionLoss
+loss: DepressionLossMSE
 # BCELoss has no args, otherwise FocalLoss can have 'alpha' and 'gamma'
 loss_args: {}
 scheduler: ReduceLROnPlateau
