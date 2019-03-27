@@ -3,6 +3,17 @@ import torch.nn as nn
 from TCN.tcn import TemporalConvNet
 
 
+def init_rnn(rnn):
+    for name, param in rnn.named_parameters():
+        if 'bias' in name:
+            nn.init.constant_(param, 0.0)
+        elif 'weight' in name:
+            nn.init.xavier_uniform_(param)
+            # Init forgetgate with 1
+            n = param.shape[0]
+            nn.init.constant_(param[n // 4:n // 2], 1.0)
+
+
 class LSTM(torch.nn.Module):
 
     """LSTM class for Depression detection"""
@@ -18,10 +29,48 @@ class LSTM(torch.nn.Module):
         """
         torch.nn.Module.__init__(self)
         kwargs.setdefault('hidden_size', 128)
-        kwargs.setdefault('num_layers', 4)
+        kwargs.setdefault('num_layers', 2)
         kwargs.setdefault('bidirectional', True)
         kwargs.setdefault('dropout', 0.2)
         self.net = nn.LSTM(inputdim, batch_first=True, **kwargs)
+        init_rnn(self.net)
+        rnn_outputdim = self.net(torch.randn(1, 50, inputdim))[0].shape
+        self.outputlayer = nn.Linear(
+            rnn_outputdim[-1], output_size)
+        nn.init.xavier_uniform_(self.outputlayer.weight)
+        nn.init.constant_(self.outputlayer.bias, 0.)
+
+    def forward(self, x):
+        """Forwards input vector through network
+
+        :x: TODO
+        :returns: TODO
+
+        """
+        x, _ = self.net(x)
+        return self.outputlayer(x)
+
+
+class GRU(torch.nn.Module):
+
+    """GRU class for Depression detection"""
+
+    def __init__(self, inputdim: int, output_size: int, **kwargs):
+        """
+
+        :inputdim:int: Input dimension
+        :output_size:int: Output dimension of GRU
+        :**kwargs: Other args, passed down to nn.GRU
+
+
+        """
+        torch.nn.Module.__init__(self)
+        kwargs.setdefault('hidden_size', 128)
+        kwargs.setdefault('num_layers', 4)
+        kwargs.setdefault('bidirectional', True)
+        kwargs.setdefault('dropout', 0.2)
+        self.net = nn.GRU(inputdim, batch_first=True, **kwargs)
+        init_rnn(self.net)
         rnn_outputdim = self.net(torch.randn(1, 50, inputdim))[0].shape
         self.outputlayer = nn.Linear(rnn_outputdim[-1], output_size)
 
@@ -34,6 +83,116 @@ class LSTM(torch.nn.Module):
         """
         x, _ = self.net(x)
         return self.outputlayer(x)
+
+
+class GRUAttn(torch.nn.Module):
+
+    """GRUAttn class for Depression detection"""
+
+    def __init__(self, inputdim: int, output_size: int, **kwargs):
+        """
+
+        :inputdim:int: Input dimension
+        :output_size:int: Output dimension of GRUAttn
+        :**kwargs: Other args, passed down to nn.GRUAttn
+
+
+        """
+        torch.nn.Module.__init__(self)
+        kwargs.setdefault('hidden_size', 128)
+        kwargs.setdefault('num_layers', 4)
+        kwargs.setdefault('bidirectional', True)
+        kwargs.setdefault('dropout', 0.2)
+        self.net = nn.GRU(inputdim, batch_first=True, **kwargs)
+        init_rnn(self.net)
+        rnn_outputdim = self.net(torch.randn(1, 50, inputdim))[0].shape
+        self.outputlayer = nn.Linear(rnn_outputdim[-1], output_size)
+        self.attn = SimpleAttention(kwargs['hidden_size']*2)
+
+    def forward(self, x):
+        """Forwards input vector through network
+
+        :x: TODO
+        :returns: TODO
+
+        """
+        x, _ = self.net(x)
+        x = self.attn(x)[0].unsqueeze(1)
+        return self.outputlayer(x)
+
+
+class GRUPosattn(torch.nn.Module):
+
+    """GRUPosattn class for Depression detection"""
+
+    def __init__(self, inputdim: int, output_size: int, **kwargs):
+        """
+
+        :inputdim:int: Input dimension
+        :output_size:int: Output dimension of GRUPosattn
+        :**kwargs: Other args, passed down to nn.GRUPosattn
+
+
+        """
+        torch.nn.Module.__init__(self)
+        kwargs.setdefault('hidden_size', 128)
+        kwargs.setdefault('num_layers', 4)
+        kwargs.setdefault('bidirectional', True)
+        kwargs.setdefault('dropout', 0.2)
+        self.net = nn.GRU(inputdim, batch_first=True, **kwargs)
+        rnn_outputdim = self.net(torch.randn(1, 50, inputdim))[0].shape
+        self.outputlayer = nn.Linear(rnn_outputdim[-1], output_size)
+        self.attn = nn.Linear(inputdim, 1)
+
+    def forward(self, x):
+        """Forwards input vector through network
+
+        :x: TODO
+        :returns: TODO
+
+        """
+        pos_attn = torch.sigmoid(self.attn(x))
+        x, _ = self.net(x)
+        x = pos_attn*x
+        return self.outputlayer(x)
+
+
+class LSTMSimpleAttn(torch.nn.Module):
+
+    """LSTMSimpleAttn class for Depression detection"""
+
+    def __init__(self, inputdim: int, output_size: int, **kwargs):
+        """
+
+        :inputdim:int: Input dimension
+        :output_size:int: Output dimension of LSTMSimpleAttn
+        :**kwargs: Other args, passed down to nn.LSTMSimpleAttn
+
+
+        """
+        torch.nn.Module.__init__(self)
+        kwargs.setdefault('hidden_size', 128)
+        kwargs.setdefault('num_layers', 4)
+        kwargs.setdefault('bidirectional', True)
+        kwargs.setdefault('dropout', 0.2)
+        self.lstm = LSTM(inputdim, output_size, **kwargs)
+        init_rnn(self.lstm)
+        self.attn = SimpleAttention(kwargs['hidden_size']*2)
+
+    def forward(self, x):
+        """Forwards input vector through network
+
+        :x: TODO
+        :returns: TODO
+
+        """
+        x, _ = self.lstm.net(x)
+        x = self.attn(x)[0].unsqueeze(1)
+        return self.lstm.outputlayer(x)
+
+    def extract_feature(self, x):
+        x, _ = self.lstm.net(x)
+        return self.attn(x)[1] * x
 
 
 class LSTMAttn(torch.nn.Module):
@@ -72,6 +231,40 @@ class LSTMAttn(torch.nn.Module):
         return self.lstm.outputlayer(x)
 
 
+class LSTMPosAttn(torch.nn.Module):
+
+    """LSTMPosAttn class for Depression detection"""
+
+    def __init__(self, inputdim: int, output_size: int, **kwargs):
+        """
+
+        :inputdim:int: Input dimension
+        :output_size:int: Output dimension of LSTMPosAttn
+        :**kwargs: Other args, passed down to nn.LSTMPosAttn
+
+
+        """
+        torch.nn.Module.__init__(self)
+        kwargs.setdefault('hidden_size', 128)
+        kwargs.setdefault('num_layers', 4)
+        kwargs.setdefault('bidirectional', True)
+        kwargs.setdefault('dropout', 0.2)
+        self.lstm = LSTM(inputdim, output_size, **kwargs)
+        self.local_embed = nn.Linear(inputdim, 1)
+
+    def forward(self, x):
+        """Forwards input vector through network
+
+        :x: TODO
+        :returns: TODO
+
+        """
+        lx = torch.sigmoid(self.local_embed(x))
+        x, _ = self.lstm.net(x)
+        x = lx*x
+        return self.lstm.outputlayer(x)
+
+
 class DNN(torch.nn.Module):
 
     """DNN class for Depression detection"""
@@ -86,8 +279,8 @@ class DNN(torch.nn.Module):
 
         """
         torch.nn.Module.__init__(self)
-        kwargs.setdefault('layers', [512]*6)
-        kwargs.setdefault('dropout', 0.5)
+        kwargs.setdefault('layers', [128]*10)
+        kwargs.setdefault('dropout', 0.2)
         layers = [inputdim] + kwargs['layers']
         net = nn.ModuleList()
         for h0, h1 in zip(layers, layers[1:]):
@@ -98,6 +291,7 @@ class DNN(torch.nn.Module):
         self.net = nn.Sequential(*net)
         net_outputdim = self.net(torch.randn(1, 50, inputdim))[0].shape
         self.outputlayer = nn.Linear(net_outputdim[-1], output_size)
+        self.pos_attn = nn.Linear(inputdim, 1)
 
     def forward(self, x):
         """Forwards input vector through network
@@ -106,7 +300,9 @@ class DNN(torch.nn.Module):
         :returns: TODO
 
         """
+        pos_attn = torch.sigmoid(self.pos_attn(x))
         x = self.net(x)
+        x = pos_attn*x
         return self.outputlayer(x)
 
 
@@ -148,7 +344,28 @@ class BTCN(nn.Module):
         return self.linear(torch.cat((forward_x, backward_x), dim=-1))
 
 
+class TCNPosAttn(nn.Module):
+
+    def __init__(self, inputdim: int, output_size: int, **kwargs):
+        super(TCNPosAttn, self).__init__()
+        kernel_size = kwargs.get('kernel_size', 5)
+        dropout = kwargs.get('dropout', 0.05)
+        num_channels = kwargs.get('num_channels', [128]*5)
+        self.tcn = TemporalConvNet(
+            inputdim, num_channels, kernel_size=kernel_size, dropout=dropout)
+        self.linear = nn.Linear(num_channels[-1], output_size)
+        self.position_attention = nn.Linear(inputdim, 1)
+
+    def forward(self, x):
+        """Inputs have to have dimension (N, C_in, L_in)"""
+        pos_attn = torch.sigmoid(self.position_attention(x))
+        x = self.tcn(x.transpose(1, 2)).transpose(1, 2)
+        x = pos_attn*x
+        return self.linear(x)
+
+
 class TCNAttn(nn.Module):
+
     def __init__(self, inputdim: int, output_size: int, **kwargs):
         super(TCNAttn, self).__init__()
         kernel_size = kwargs.get('kernel_size', 5)
@@ -157,14 +374,11 @@ class TCNAttn(nn.Module):
         self.tcn = TemporalConvNet(
             inputdim, num_channels, kernel_size=kernel_size, dropout=dropout)
         self.linear = nn.Linear(num_channels[-1], output_size)
-        self.position_attention = nn.Linear(inputdim, 1)
         self.attn = SimpleAttention(num_channels[-1])
 
     def forward(self, x):
         """Inputs have to have dimension (N, C_in, L_in)"""
-        pos_attn = torch.sigmoid(self.position_attention(x))
         x = self.tcn(x.transpose(1, 2)).transpose(1, 2)
-        x = pos_attn*x
         x = self.attn(x)[0].unsqueeze(1)
         return self.linear(x)
 
@@ -215,12 +429,12 @@ class SimpleAttention(nn.Module):
         nn.Module.__init__(self)
 
         self._inputdim = inputdim
-        self.attn = nn.Linear(inputdim, 1)
+        self.attn = nn.Linear(inputdim, 1, bias=False)
+        nn.init.xavier_uniform_(self.attn.weight)
 
     def forward(self, x):
         weights = torch.softmax(self.attn(x), dim=1)
-        transform = torch.sigmoid(x)
-        out = torch.bmm(weights.transpose(1, 2), transform).squeeze(0)
+        out = torch.bmm(weights.transpose(1, 2), torch.tanh(x)).squeeze(0)
         return out, weights
 
 
@@ -285,14 +499,15 @@ class CRNN(nn.Module):
         super(CRNN, self).__init__()
         self._inputdim = inputdim
         self._embed_size = output_size
-        self._filtersizes = kwargs.get('filtersizes', [3, 3, 3, 3, 3, 3, 3])
-        self._filter = kwargs.get('filter', [16, 32, 128, 128, 128, 128, 128])
+        self._filtersizes = kwargs.get(
+            'filtersizes', [3, 3, 3, 3, 3])
+        self._filter = kwargs.get(
+            'filter', [16, 32, 128, 128, 128])
         self._pooling = kwargs.get(
-            'pooling', [2, 2, 2, 2, 2, 2])
+            'pooling', [(1, 4), (1, 3), (1, 2), (1, 2), (1, 2)])
         self._hidden_size = kwargs.get('hidden_size', 128)
         self._bidirectional = kwargs.get('bidirectional', True)
         self._rnn = kwargs.get('rnn', 'BiGRU')
-        self._pooltype = kwargs.get('pooltype', 'MaxPool2d')
         self._activation = kwargs.get('activation', 'ReLU')
         self._blocktype = kwargs.get('blocktype', 'StandardBlock')
         self._bn = kwargs.get('bn', True)
@@ -310,7 +525,7 @@ class CRNN(nn.Module):
                 inputfilter=h0, outputfilter=h1, kernel_size=filtersize, padding=int(filtersize)//2, bn=self._bn, stride=1, activation=current_activation))
             # Poolingsize will be None if pooling is finished
             if poolingsize:
-                net.append(nn.AvgPool2d(poolingsize))
+                net.append(nn.MaxPool2d(poolingsize))
             # Only dropout at last layer before GRU
             if nl == (len(self._filter) - 2):
                 net.append(nn.Dropout(0.1))

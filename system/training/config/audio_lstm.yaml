@@ -13,10 +13,7 @@ dataloader_args:
         num_workers: 1
 optimizer: Adam
 optimizer_args:
-        lr: 0.001
-        betas: [0.9, 0.999]
-        eps: 0.00000001
-        weight_decay: 0.0
+        lr: 0.004
 epochs: 25
 feature_args:
         cmvn: False
@@ -29,7 +26,7 @@ scaler_args:
 improvecriterion: loss # Can also be acc | loss
 saveinterval: 10 #Save every 5 epochs to see what happened
 poolingfunction: mean
-loss: DepressionLossMSE
+loss: DepressionLossSmooth
 # BCELoss has no args, otherwise FocalLoss can have 'alpha' and 'gamma'
 loss_args: {}
 scheduler: ReduceLROnPlateau

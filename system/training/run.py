@@ -153,11 +153,11 @@ def criterion_improver(mode):
 
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-torch.manual_seed(200)
-np.random.seed(200)
+torch.manual_seed(0)
+np.random.seed(0)
 
 if device == 'cuda':
-    torch.cuda.manual_seed_all(200)
+    torch.cuda.manual_seed_all(0)
 
 
 def train(config='config/audio_lstm.yaml', **kwargs):
@@ -238,6 +238,7 @@ def train(config='config/audio_lstm.yaml', **kwargs):
     logger.info("<== Model ==>")
     for line in pformat(model).split('\n'):
         logger.info(line)
+    model = model.to(device)
     optimizer = getattr(
         torch.optim, config_parameters['optimizer'])(
         model.parameters(),
@@ -254,7 +255,6 @@ def train(config='config/audio_lstm.yaml', **kwargs):
 
     trainedmodelpath = os.path.join(outputdir, 'model.th')
 
-    model = model.to(device)
     criterion_improved = criterion_improver(
         config_parameters['improvecriterion'])
     header = [
@@ -318,6 +318,8 @@ def parse_poolingfunction(poolingfunction_name='mean'):
             x.exp() * x).sum(d) / x.exp().sum(d)
     elif poolingfunction_name == 'time':  # Last timestep
         def pooling_function(x, d): return x.select(d, -1)
+    elif poolingfunction_name == 'first':
+        def pooling_function(x, d): return x.select(d, 0)
 
     return pooling_function
 
@@ -325,8 +327,12 @@ def parse_poolingfunction(poolingfunction_name='mean'):
 def _extract_features_from_model(model, features, scaler=None):
     if model.__class__.__name__ == 'LSTM':
         fwdmodel = torch.nn.Sequential(model.net)
-    if model.__class__.__name__ == 'TCN':
+    elif model.__class__.__name__ == 'LSTMSimpleAttn':
+        fwdmodel = torch.nn.Sequential(model)
+    elif model.__class__.__name__ == 'TCN':
         fwdmodel = None
+    else:
+        assert False, "Model not prepared for extraction"
     ret = {}
     with torch.no_grad():
         model = model.to(device)
@@ -360,13 +366,14 @@ def extract_features(model_path: str, features='trainfeatures'):
     return outputfile
 
 
-def stats(model_path: str, outputfile: str = 'stats.txt'):
+def stats(model_path: str, outputfile: str = 'stats.txt', cutoff: int = None):
     """Prints out the stats for the given model ( MAE, RMSE, F1, Pre, Rec)
 
     :model_path:str: TODO
     :returns: TODO
 
     """
+    from tabulate import tabulate
     modeldump = torch.load(model_path, lambda storage, loc: storage)
     model_dir = os.path.dirname(model_path)
     config_parameters = modeldump['config']
@@ -379,29 +386,71 @@ def stats(model_path: str, outputfile: str = 'stats.txt'):
         'PHQ8_Score', 'PHQ8_Binary']].T.apply(tuple).to_dict()
     outputfile = os.path.join(model_dir, outputfile)
     y_score_true, y_score_pred, y_binary_pred, y_binary_true = [], [], [], []
-    scores = _forward_model(model_path, dev_features)
+    scores = _forward_model(model_path, dev_features, cutoff=cutoff)
     for key, score in scores.items():
         score_pred, binary_pred = torch.chunk(score, 2, dim=-1)
         y_score_pred.append(score_pred.numpy())
         y_score_true.append(dev_labels[key][0])
         y_binary_pred.append(torch.sigmoid(
-            binary_pred).round().numpy().astype(int))
+            binary_pred).round().numpy().astype(int).item())
         y_binary_true.append(dev_labels[key][1])
 
     with open(outputfile, 'w') as wp:
-        report = metrics.classification_report(
-            y_binary_true, y_binary_pred)
+        pre = metrics.precision_score(
+            y_binary_true, y_binary_pred, average='macro')
+        rec = metrics.recall_score(
+            y_binary_true, y_binary_pred, average='macro')
+        f1 = 2*pre*rec / (pre+rec)
         rmse = np.sqrt(metrics.mean_squared_error(y_score_true, y_score_pred))
         mae = metrics.mean_absolute_error(y_score_true, y_score_pred)
-        print(report, file=wp)
-        print("RMSE: {:.3f}".format(rmse), file=wp)
-        print("MAE: {:.3f}".format(mae), file=wp)
-        print(report)
-        print("RMSE: {:.3f}".format(rmse))
-        print("MAE: {:.3f}".format(mae))
+        df = pd.DataFrame(
+            {'precision': pre, 'recall': rec, 'F1': f1, 'MAE': mae, 'RMSE': rmse}, index=["Macro"])
+        print(tabulate(df, headers='keys'), file=wp)
+        print(tabulate(df, headers='keys'))
 
 
-def _forward_model(model_path: str, features: str, dopooling: bool = True):
+def fuse(model_paths: list, outputfile='scores.txt', cutoff: int = None):
+    from tabulate import tabulate
+    scores = []
+    for model_path in model_paths:
+        modeldump = torch.load(model_path, lambda storage, loc: storage)
+        config_parameters = modeldump['config']
+        dev_features = config_parameters['devfeatures']
+        dev_label_df = pd.read_csv(
+            config_parameters['devlabels']).set_index('Participant_ID')
+        dev_label_df.index = dev_label_df.index.astype(str)
+        score = _forward_model(model_path, dev_features, cutoff=cutoff)
+        for speaker, pred_score in score.items():
+            scores.append({
+                'speaker': speaker,
+                'MAE': float(pred_score[0].numpy()),
+                'binary': float(torch.sigmoid(pred_score[1]).numpy()),
+                'model': model_path,
+                'binary_true': dev_label_df.loc[speaker, 'PHQ8_Binary'],
+                'MAE_true': dev_label_df.loc[speaker, 'PHQ8_Score']
+            })
+    df = pd.DataFrame(scores)
+
+    spkmeans = df.groupby('speaker')[['MAE', 'MAE_true', 'binary', 'binary_true']].mean()
+    spkmeans['binary'] = spkmeans['binary'] > 0.5
+
+    with open(outputfile, 'w') as wp:
+        pre = metrics.precision_score(
+            spkmeans['binary_true'].values, spkmeans['binary'].values, average='macro')
+        rec = metrics.recall_score(
+            spkmeans['binary_true'].values, spkmeans['binary'].values, average='macro')
+        f1 = 2*pre*rec / (pre+rec)
+        rmse = np.sqrt(metrics.mean_squared_error(
+            spkmeans['MAE_true'].values, spkmeans['MAE'].values))
+        mae = metrics.mean_absolute_error(
+            spkmeans['MAE_true'].values, spkmeans['MAE'].values)
+        df = pd.DataFrame(
+            {'precision': pre, 'recall': rec, 'F1': f1, 'MAE': mae, 'RMSE': rmse}, index=["Macro"])
+        print(tabulate(df, headers='keys'), file=wp)
+        print(tabulate(df, headers='keys'))
+
+
+def _forward_model(model_path: str, features: str, dopooling: bool = True, cutoff=None):
     modeldump = torch.load(model_path, lambda storage, loc: storage)
     scaler = modeldump['scaler']
     config_parameters = modeldump['config']
@@ -410,10 +459,14 @@ def _forward_model(model_path: str, features: str, dopooling: bool = True):
     kaldi_string = parsecopyfeats(
         features, **config_parameters['feature_args'])
     ret = {}
+
     with torch.no_grad():
         model = modeldump['model'].to(device).eval()
         for key, feat in kaldi_io.read_mat_ark(kaldi_string):
             feat = scaler.transform(feat)
+            if cutoff:
+                # Cut all after cutoff
+                feat = feat[:cutoff]
             feat = torch.from_numpy(feat).to(device).unsqueeze(0)
             output = model(feat).cpu()
             if dopooling:
@@ -426,10 +479,41 @@ def trainstats(config: str = 'config/audio_lstm.yaml', **kwargs):
     """Runs training and then prints dev stats
 
     :config:str: config file
-    :**kwargs: Extra overwrite configs 
+    :**kwargs: Extra overwrite configs
     :returns: None
 
     """
+    output_model = train(config, **kwargs)
+    best_model = os.path.join(output_model, 'model.th')
+    stats(best_model)
+
+
+def run_search(config: str = 'config/audio_lstm.yaml', lr=0.1, mom=0.9, nest=False, **kwargs):
+    """Runs training and then prints dev stats
+
+    :config:str: config file
+    :**kwargs: Extra overwrite configs
+    :returns: None
+
+    """
+    optimizer_args = {'lr': lr, 'momentum': mom, 'nesterov': nest}
+    kwargs['optimizer_args'] = optimizer_args
+    output_model = train(config, **kwargs)
+    best_model = os.path.join(output_model, 'model.th')
+    stats(best_model)
+
+
+def run_search_adam(config: str = 'config/audio_lstm.yaml', lr=0.1, **kwargs):
+    """Runs training and then prints dev stats
+
+    :config:str: config file
+    :**kwargs: Extra overwrite configs
+    :returns: None
+
+    """
+    optimizer_args = {'lr': lr}
+    kwargs['optimizer'] = 'Adam'
+    kwargs['optimizer_args'] = optimizer_args
     output_model = train(config, **kwargs)
     best_model = os.path.join(output_model, 'model.th')
     stats(best_model)
@@ -440,6 +524,9 @@ if __name__ == '__main__':
         'train': train,
         'stats': stats,
         'trainstats': trainstats,
+        'search': run_search,
+        'searchadam': run_search_adam,
         'ex': extract_features,
-        'fwd': _forward_model
+        'fwd': _forward_model,
+        'fuse': fuse,
     })
