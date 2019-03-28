@@ -512,7 +512,6 @@ def run_search_adam(config: str = 'config/audio_lstm.yaml', lr=0.1, **kwargs):
 
     """
     optimizer_args = {'lr': lr}
-    kwargs['optimizer'] = 'Adam'
     kwargs['optimizer_args'] = optimizer_args
     output_model = train(config, **kwargs)
     best_model = os.path.join(output_model, 'model.th')

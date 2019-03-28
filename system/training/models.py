@@ -9,9 +9,6 @@ def init_rnn(rnn):
             nn.init.constant_(param, 0.0)
         elif 'weight' in name:
             nn.init.xavier_uniform_(param)
-            # Init forgetgate with 1
-            n = param.shape[0]
-            nn.init.constant_(param[n // 4:n // 2], 1.0)
 
 
 class LSTM(torch.nn.Module):
@@ -37,8 +34,6 @@ class LSTM(torch.nn.Module):
         rnn_outputdim = self.net(torch.randn(1, 50, inputdim))[0].shape
         self.outputlayer = nn.Linear(
             rnn_outputdim[-1], output_size)
-        nn.init.xavier_uniform_(self.outputlayer.weight)
-        nn.init.constant_(self.outputlayer.bias, 0.)
 
     def forward(self, x):
         """Forwards input vector through network
