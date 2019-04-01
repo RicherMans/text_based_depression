@@ -39,7 +39,7 @@ def plot(report_md: str = 'report.md'):
                        )
                 output_filename = "{}_table{}.png".format(
                     report_fname, table_id)
-                plt.save(output_filename, dpi=300)
+                plt.save(output_filename, dpi=150)
                 print("Saving to {}".format(output_filename))
 
 
