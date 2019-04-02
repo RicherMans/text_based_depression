@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-from TCN.tcn import TemporalConvNet
 
 
 def init_rnn(rnn):
