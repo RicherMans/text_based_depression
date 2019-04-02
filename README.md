@@ -38,9 +38,17 @@ The dataset is freely available for research purposes and can be found [here](ht
 
 The preprocessing feature extraction scripts can be found in `data_preprocess/`.
 
+We exclusively use [kaldi](http://kaldi-asr.org/) as our data processing pipeline ( except for extraction ). 
+
+ELMo features can be rather directly downloaded and pretrained given one installed `allennlp`. 
+However, BERT embeddings require the download of a [pretrained BERT](https://github.com/google-research/bert).
+In order to have easy access to BERT embeddings we use [bert serving client](https://pypi.org/project/bert-serving-client/). Here we prepared a simple script `start_bert_server.sh` in order to start the serving client. We recommend the use of screen or tmux.
+
+
 In order to extract the features, prepare a folder named `labels` and softlink the `train_split_Depression_AVEC2017.csv` and dev files into it.
 
 Further prepare the transcripts for feature extraction by directly copying all transcripts into a dir called `labels_processed`.
+In other cases pass `--transcriptdir OUTDIRNAME` to any of the extraction scripts.
 
 
 # Running the code
