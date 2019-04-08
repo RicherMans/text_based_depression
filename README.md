@@ -79,4 +79,6 @@ The code is centered around the config files placed at `config/`. Each parameter
 * `fwd`: Debugging function to forward some features through a network
 * `fuse`: Fusion of two models or more. Fusion is done by averaging each output.
 
+## Notes
 
+Due to the limited amount of training data, reproducing the results might be problematic. In our work we specifically pointed out that the proposed results are chosen as the peak over multiple runs. 
