@@ -46,7 +46,7 @@ The easies way to do that is just use bash or pandas (python) to merge all files
 
 ```bash
 cd labels_processed;
-python -c from glob import glob as g; import pandas as pd; pd.concat([pd.read_csv(f,sep='\t') for f in g('*TRANS*.csv')]).to_csv('all_transcripts.csv', index=False, sep='\t')
+python -c "from glob import glob as g; import pandas as pd; pd.concat([pd.read_csv(f,sep='\t') for f in g('*TRANS*.csv')]).to_csv('all_transcripts.csv', index=False, sep='\t')"
 ```
 
 Then just run the `extract_text_gensim.py` script, which extracts `100dim` features into the `features/text` folder.
