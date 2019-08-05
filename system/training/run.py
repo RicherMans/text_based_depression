@@ -21,7 +21,6 @@ import torchnet as tnt
 
 class BinarySimilarMeter(object):
     """Only counts ones, does not consider zeros as being correct"""
-
     def __init__(self, sigmoid_output=False):
         super(BinarySimilarMeter, self).__init__()
         self.sigmoid_output = sigmoid_output
@@ -47,7 +46,6 @@ class BinarySimilarMeter(object):
 
 class BinaryAccuracyMeter(object):
     """Counts all outputs, including zero"""
-
     def __init__(self, sigmoid_output=False):
         super(BinaryAccuracyMeter, self).__init__()
         self.sigmoid_output = sigmoid_output
@@ -84,7 +82,12 @@ def parsecopyfeats(feat, cmvn=False, delta=False, splice=None):
     return outstr
 
 
-def runepoch(dataloader, model, criterion, optimizer=None, dotrain=True, poolfun=lambda x, d: x.mean(d)):
+def runepoch(dataloader,
+             model,
+             criterion,
+             optimizer=None,
+             dotrain=True,
+             poolfun=lambda x, d: x.mean(d)):
     model = model.train() if dotrain else model.eval()
     # By default use average pooling
     loss_meter = tnt.meter.AverageValueMeter()
@@ -109,9 +112,8 @@ def runepoch(dataloader, model, criterion, optimizer=None, dotrain=True, poolfun
 def genlogger(outdir, fname):
     formatter = logging.Formatter(
         "[ %(levelname)s : %(asctime)s ] - %(message)s")
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format="[ %(levelname)s : %(asctime)s ] - %(message)s")
+    logging.basicConfig(level=logging.DEBUG,
+                        format="[ %(levelname)s : %(asctime)s ] - %(message)s")
     logger = logging.getLogger("Pyobj, f")
     # Dump log to file
     fh = logging.FileHandler(os.path.join(outdir, fname))
@@ -149,15 +151,19 @@ def criterion_improver(mode):
             best_value = x
             return True
         return False
+
     return inner
 
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+device = 'cpu'
+if torch.cuda.is_available(
+) and 'SLURM_JOB_PARTITION' in os.environ and 'gpu' in os.environ[
+        'SLURM_JOB_PARTITION']:
+    device = 'cuda'
+    torch.cuda.manual_seed(0)
+device = torch.device(device)
 torch.manual_seed(0)
 np.random.seed(0)
-
-if device == 'cuda':
-    torch.cuda.manual_seed_all(0)
 
 
 def train(config='config/audio_lstm.yaml', **kwargs):
@@ -170,8 +176,7 @@ def train(config='config/audio_lstm.yaml', **kwargs):
 
     config_parameters = parse_config_or_kwargs(config, **kwargs)
     outputdir = os.path.join(
-        config_parameters['outputpath'],
-        config_parameters['model'],
+        config_parameters['outputpath'], config_parameters['model'],
         datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%f'))
     try:
         os.makedirs(outputdir)
@@ -184,26 +189,22 @@ def train(config='config/audio_lstm.yaml', **kwargs):
     for line in pformat(config_parameters).split('\n'):
         logger.info(line)
 
-    train_kaldi_string = parsecopyfeats(
-        config_parameters['trainfeatures'], **config_parameters['feature_args'])
-    dev_kaldi_string = parsecopyfeats(
-        config_parameters['devfeatures'], **config_parameters['feature_args'])
+    train_kaldi_string = parsecopyfeats(config_parameters['trainfeatures'],
+                                        **config_parameters['feature_args'])
+    dev_kaldi_string = parsecopyfeats(config_parameters['devfeatures'],
+                                      **config_parameters['feature_args'])
 
     scaler = getattr(
-        pre, config_parameters['scaler'])(
-        **config_parameters['scaler_args'])
+        pre, config_parameters['scaler'])(**config_parameters['scaler_args'])
     inputdim = -1
-    logger.info(
-        "<== Estimating Scaler ({}) ==>".format(
-            scaler.__class__.__name__))
+    logger.info("<== Estimating Scaler ({}) ==>".format(
+        scaler.__class__.__name__))
     for kid, feat in kaldi_io.read_mat_ark(train_kaldi_string):
         scaler.partial_fit(feat)
         inputdim = feat.shape[-1]
     assert inputdim > 0, "Reading inputstream failed"
-    logger.info(
-        "Features: {} Input dimension: {}".format(
-            config_parameters['trainfeatures'],
-            inputdim))
+    logger.info("Features: {} Input dimension: {}".format(
+        config_parameters['trainfeatures'], inputdim))
     logger.info("<== Labels ==>")
     train_label_df = pd.read_csv(
         config_parameters['trainlabels']).set_index('Participant_ID')
@@ -224,14 +225,11 @@ def train(config='config/audio_lstm.yaml', **kwargs):
         train_labels,
         transform=scaler.transform,
         **config_parameters['dataloader_args'])
-    cv_dataloader = create_dataloader(
-        dev_kaldi_string,
-        dev_labels,
-        transform=scaler.transform,
-        **config_parameters['dataloader_args'])
-    model = getattr(
-        models,
-        config_parameters['model'])(
+    cv_dataloader = create_dataloader(dev_kaldi_string,
+                                      dev_labels,
+                                      transform=scaler.transform,
+                                      **config_parameters['dataloader_args'])
+    model = getattr(models, config_parameters['model'])(
         inputdim=inputdim,
         output_size=n_labels,
         **config_parameters['model_args'])
@@ -239,18 +237,14 @@ def train(config='config/audio_lstm.yaml', **kwargs):
     for line in pformat(model).split('\n'):
         logger.info(line)
     model = model.to(device)
-    optimizer = getattr(
-        torch.optim, config_parameters['optimizer'])(
-        model.parameters(),
-        **config_parameters['optimizer_args'])
+    optimizer = getattr(torch.optim, config_parameters['optimizer'])(
+        model.parameters(), **config_parameters['optimizer_args'])
 
-    scheduler = getattr(
-        torch.optim.lr_scheduler,
-        config_parameters['scheduler'])(
-        optimizer,
-        **config_parameters['scheduler_args'])
-    criterion = getattr(losses, config_parameters['loss'])(
-        **config_parameters['loss_args'])
+    scheduler = getattr(torch.optim.lr_scheduler,
+                        config_parameters['scheduler'])(
+                            optimizer, **config_parameters['scheduler_args'])
+    criterion = getattr(
+        losses, config_parameters['loss'])(**config_parameters['loss_args'])
     criterion.to(device)
 
     trainedmodelpath = os.path.join(outputdir, 'model.th')
@@ -264,41 +258,51 @@ def train(config='config/audio_lstm.yaml', **kwargs):
         "Acc(T)",
         "Acc(CV)",
     ]
-    for line in tp.header(
-        header,
-            style='grid').split('\n'):
+    for line in tp.header(header, style='grid').split('\n'):
         logger.info(line)
 
     poolingfunction_name = config_parameters['poolingfunction']
     pooling_function = parse_poolingfunction(poolingfunction_name)
-    for epoch in range(1, config_parameters['epochs']+1):
+    for epoch in range(1, config_parameters['epochs'] + 1):
         train_utt_loss_mean_std, train_utt_acc = runepoch(
-            train_dataloader, model, criterion, optimizer, dotrain=True, poolfun=pooling_function)
-        cv_utt_loss_mean_std, cv_utt_acc = runepoch(
-            cv_dataloader, model,  criterion, dotrain=False, poolfun=pooling_function)
+            train_dataloader,
+            model,
+            criterion,
+            optimizer,
+            dotrain=True,
+            poolfun=pooling_function)
+        cv_utt_loss_mean_std, cv_utt_acc = runepoch(cv_dataloader,
+                                                    model,
+                                                    criterion,
+                                                    dotrain=False,
+                                                    poolfun=pooling_function)
         logger.info(
-            tp.row(
-                (epoch,) +
-                (train_utt_loss_mean_std[0],
-                 cv_utt_loss_mean_std[0],
-                 train_utt_acc, cv_utt_acc),
-                style='grid'))
+            tp.row((epoch, ) +
+                   (train_utt_loss_mean_std[0], cv_utt_loss_mean_std[0],
+                    train_utt_acc, cv_utt_acc),
+                   style='grid'))
         epoch_meanloss = cv_utt_loss_mean_std[0]
         if epoch % config_parameters['saveinterval'] == 0:
-            torch.save({'model': model,
-                        'scaler': scaler,
-                        # 'encoder': many_hot_encoder,
-                        'config': config_parameters},
-                       os.path.join(outputdir, 'model_{}.th'.format(epoch)))
+            torch.save(
+                {
+                    'model': model,
+                    'scaler': scaler,
+                    # 'encoder': many_hot_encoder,
+                    'config': config_parameters
+                },
+                os.path.join(outputdir, 'model_{}.th'.format(epoch)))
         # ReduceOnPlateau needs a value to work
         schedarg = epoch_meanloss if scheduler.__class__.__name__ == 'ReduceLROnPlateau' else None
         scheduler.step(schedarg)
         if criterion_improved(epoch_meanloss):
-            torch.save({'model': model,
-                        'scaler': scaler,
-                        # 'encoder': many_hot_encoder,
-                        'config': config_parameters},
-                       trainedmodelpath)
+            torch.save(
+                {
+                    'model': model,
+                    'scaler': scaler,
+                    # 'encoder': many_hot_encoder,
+                    'config': config_parameters
+                },
+                trainedmodelpath)
         if optimizer.param_groups[0]['lr'] < 1e-7:
             break
     logger.info(tp.bottom(len(header), style='grid'))
@@ -308,18 +312,29 @@ def train(config='config/audio_lstm.yaml', **kwargs):
 
 def parse_poolingfunction(poolingfunction_name='mean'):
     if poolingfunction_name == 'mean':
-        def pooling_function(x, d): return x.mean(d)
+
+        def pooling_function(x, d):
+            return x.mean(d)
     elif poolingfunction_name == 'max':
-        def pooling_function(x, d): return x.max(d)[0]
+
+        def pooling_function(x, d):
+            return x.max(d)[0]
     elif poolingfunction_name == 'linear':
-        def pooling_function(x, d): return (x**2).sum(d) / x.sum(d)
+
+        def pooling_function(x, d):
+            return (x**2).sum(d) / x.sum(d)
     elif poolingfunction_name == 'exp':
-        def pooling_function(x, d): return (
-            x.exp() * x).sum(d) / x.exp().sum(d)
+
+        def pooling_function(x, d):
+            return (x.exp() * x).sum(d) / x.exp().sum(d)
     elif poolingfunction_name == 'time':  # Last timestep
-        def pooling_function(x, d): return x.select(d, -1)
+
+        def pooling_function(x, d):
+            return x.select(d, -1)
     elif poolingfunction_name == 'first':
-        def pooling_function(x, d): return x.select(d, 0)
+
+        def pooling_function(x, d):
+            return x.select(d, 0)
 
     return pooling_function
 
@@ -356,8 +371,8 @@ def extract_features(model_path: str, features='trainfeatures'):
     model = modeldump['model']
 
     outputfile = os.path.join(model_dir, features + '.ark')
-    dev_features = parsecopyfeats(
-        dev_features, **config_parameters['feature_args'])
+    dev_features = parsecopyfeats(dev_features,
+                                  **config_parameters['feature_args'])
 
     vectors = _extract_features_from_model(model, dev_features, scaler)
     with open(outputfile, 'wb') as wp:
@@ -382,8 +397,8 @@ def stats(model_path: str, outputfile: str = 'stats.txt', cutoff: int = None):
         config_parameters['devlabels']).set_index('Participant_ID')
     dev_label_df.index = dev_label_df.index.astype(str)
 
-    dev_labels = dev_label_df.loc[:, [
-        'PHQ8_Score', 'PHQ8_Binary']].T.apply(tuple).to_dict()
+    dev_labels = dev_label_df.loc[:, ['PHQ8_Score', 'PHQ8_Binary']].T.apply(
+        tuple).to_dict()
     outputfile = os.path.join(model_dir, outputfile)
     y_score_true, y_score_pred, y_binary_pred, y_binary_true = [], [], [], []
     scores = _forward_model(model_path, dev_features, cutoff=cutoff)
@@ -391,20 +406,29 @@ def stats(model_path: str, outputfile: str = 'stats.txt', cutoff: int = None):
         score_pred, binary_pred = torch.chunk(score, 2, dim=-1)
         y_score_pred.append(score_pred.numpy())
         y_score_true.append(dev_labels[key][0])
-        y_binary_pred.append(torch.sigmoid(
-            binary_pred).round().numpy().astype(int).item())
+        y_binary_pred.append(
+            torch.sigmoid(binary_pred).round().numpy().astype(int).item())
         y_binary_true.append(dev_labels[key][1])
 
     with open(outputfile, 'w') as wp:
-        pre = metrics.precision_score(
-            y_binary_true, y_binary_pred, average='macro')
-        rec = metrics.recall_score(
-            y_binary_true, y_binary_pred, average='macro')
-        f1 = 2*pre*rec / (pre+rec)
+        pre = metrics.precision_score(y_binary_true,
+                                      y_binary_pred,
+                                      average='macro')
+        rec = metrics.recall_score(y_binary_true,
+                                   y_binary_pred,
+                                   average='macro')
+        f1 = 2 * pre * rec / (pre + rec)
         rmse = np.sqrt(metrics.mean_squared_error(y_score_true, y_score_pred))
         mae = metrics.mean_absolute_error(y_score_true, y_score_pred)
         df = pd.DataFrame(
-            {'precision': pre, 'recall': rec, 'F1': f1, 'MAE': mae, 'RMSE': rmse}, index=["Macro"])
+            {
+                'precision': pre,
+                'recall': rec,
+                'F1': f1,
+                'MAE': mae,
+                'RMSE': rmse
+            },
+            index=["Macro"])
         print(tabulate(df, headers='keys'), file=wp)
         print(tabulate(df, headers='keys'))
 
@@ -422,42 +446,63 @@ def fuse(model_paths: list, outputfile='scores.txt', cutoff: int = None):
         score = _forward_model(model_path, dev_features, cutoff=cutoff)
         for speaker, pred_score in score.items():
             scores.append({
-                'speaker': speaker,
-                'MAE': float(pred_score[0].numpy()),
-                'binary': float(torch.sigmoid(pred_score[1]).numpy()),
-                'model': model_path,
-                'binary_true': dev_label_df.loc[speaker, 'PHQ8_Binary'],
-                'MAE_true': dev_label_df.loc[speaker, 'PHQ8_Score']
+                'speaker':
+                speaker,
+                'MAE':
+                float(pred_score[0].numpy()),
+                'binary':
+                float(torch.sigmoid(pred_score[1]).numpy()),
+                'model':
+                model_path,
+                'binary_true':
+                dev_label_df.loc[speaker, 'PHQ8_Binary'],
+                'MAE_true':
+                dev_label_df.loc[speaker, 'PHQ8_Score']
             })
     df = pd.DataFrame(scores)
 
-    spkmeans = df.groupby('speaker')[['MAE', 'MAE_true', 'binary', 'binary_true']].mean()
+    spkmeans = df.groupby('speaker')[[
+        'MAE', 'MAE_true', 'binary', 'binary_true'
+    ]].mean()
     spkmeans['binary'] = spkmeans['binary'] > 0.5
 
     with open(outputfile, 'w') as wp:
-        pre = metrics.precision_score(
-            spkmeans['binary_true'].values, spkmeans['binary'].values, average='macro')
-        rec = metrics.recall_score(
-            spkmeans['binary_true'].values, spkmeans['binary'].values, average='macro')
-        f1 = 2*pre*rec / (pre+rec)
-        rmse = np.sqrt(metrics.mean_squared_error(
-            spkmeans['MAE_true'].values, spkmeans['MAE'].values))
-        mae = metrics.mean_absolute_error(
-            spkmeans['MAE_true'].values, spkmeans['MAE'].values)
+        pre = metrics.precision_score(spkmeans['binary_true'].values,
+                                      spkmeans['binary'].values,
+                                      average='macro')
+        rec = metrics.recall_score(spkmeans['binary_true'].values,
+                                   spkmeans['binary'].values,
+                                   average='macro')
+        f1 = 2 * pre * rec / (pre + rec)
+        rmse = np.sqrt(
+            metrics.mean_squared_error(spkmeans['MAE_true'].values,
+                                       spkmeans['MAE'].values))
+        mae = metrics.mean_absolute_error(spkmeans['MAE_true'].values,
+                                          spkmeans['MAE'].values)
         df = pd.DataFrame(
-            {'precision': pre, 'recall': rec, 'F1': f1, 'MAE': mae, 'RMSE': rmse}, index=["Macro"])
+            {
+                'precision': pre,
+                'recall': rec,
+                'F1': f1,
+                'MAE': mae,
+                'RMSE': rmse
+            },
+            index=["Macro"])
         print(tabulate(df, headers='keys'), file=wp)
         print(tabulate(df, headers='keys'))
 
 
-def _forward_model(model_path: str, features: str, dopooling: bool = True, cutoff=None):
+def _forward_model(model_path: str,
+                   features: str,
+                   dopooling: bool = True,
+                   cutoff=None):
     modeldump = torch.load(model_path, lambda storage, loc: storage)
     scaler = modeldump['scaler']
     config_parameters = modeldump['config']
     pooling_function = parse_poolingfunction(
         config_parameters['poolingfunction'])
-    kaldi_string = parsecopyfeats(
-        features, **config_parameters['feature_args'])
+    kaldi_string = parsecopyfeats(features,
+                                  **config_parameters['feature_args'])
     ret = {}
 
     with torch.no_grad():
@@ -488,7 +533,11 @@ def trainstats(config: str = 'config/audio_lstm.yaml', **kwargs):
     stats(best_model)
 
 
-def run_search(config: str = 'config/audio_lstm.yaml', lr=0.1, mom=0.9, nest=False, **kwargs):
+def run_search(config: str = 'config/audio_lstm.yaml',
+               lr=0.1,
+               mom=0.9,
+               nest=False,
+               **kwargs):
     """Runs training and then prints dev stats
 
     :config:str: config file
