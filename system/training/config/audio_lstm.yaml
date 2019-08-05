@@ -1,0 +1,39 @@
+model: LSTM
+trainfeatures: features/audio/train_higher_order_participant.ark
+devfeatures: features/audio/dev_higher_order_participant.ark
+model_args:
+        bidirectional: True
+        hidden_size: 128
+        num_layers: 3
+trainlabels: labels/train_split_Depression_AVEC2017.csv
+devlabels: labels/dev_split_Depression_AVEC2017.csv
+outputpath: experiments/audio/
+dataloader_args:
+        batch_size: 1
+        num_workers: 1
+optimizer: Adam
+optimizer_args:
+        lr: 0.004
+epochs: 25
+feature_args:
+        cmvn: False
+        delta: False
+        splice: False
+scaler: StandardScaler # Can be any of sklearn.preprocessing that supports fit_partial
+scaler_args:
+        with_std : True
+        with_mean : True        
+improvecriterion: loss # Can also be acc | loss
+saveinterval: 10 #Save every 5 epochs to see what happened
+poolingfunction: mean
+loss: DepressionLossSmooth
+# BCELoss has no args, otherwise FocalLoss can have 'alpha' and 'gamma'
+loss_args: {}
+scheduler: ReduceLROnPlateau
+scheduler_args:
+        mode: min
+        factor: 0.1
+        patience: 3
+        cooldown: 1
+        verbose: False
+        threshold: 0.001
