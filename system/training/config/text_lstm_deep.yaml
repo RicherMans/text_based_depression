@@ -10,10 +10,10 @@ devlabels: labels/dev_split_Depression_AVEC2017.csv
 outputpath: experiments/text
 dataloader_args:
         batch_size: 1
-        num_workers: 1
+        num_workers: 2
 optimizer: Adam
 optimizer_args:
-        lr: 0.004
+        lr: 0.01
 epochs: 200 
 feature_args:
         cmvn: False

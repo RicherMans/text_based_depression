@@ -1,16 +1,17 @@
 model: LSTM
+seed: 0
 trainfeatures: features/text/train_text_100dim.ark
 devfeatures: features/text/dev_text_100dim.ark
 model_args:
         bidirectional: True
-        hidden_size: 4
+        hidden_size: 128
         num_layers: 2
 trainlabels: labels/train_split_Depression_AVEC2017.csv
 devlabels: labels/dev_split_Depression_AVEC2017.csv
 outputpath: experiments/text
 dataloader_args:
         batch_size: 1
-        num_workers: 1
+        num_workers: 2
 optimizer: Adam
 optimizer_args:
         lr: 0.004
@@ -21,8 +22,8 @@ feature_args:
         splice: False
 scaler: StandardScaler # Can be any of sklearn.preprocessing that supports fit_partial
 scaler_args:
-        with_std : True
-        with_mean : True        
+        with_std : False
+        with_mean : False
 improvecriterion: loss # Can also be acc | loss
 saveinterval: 10 #Save every 5 epochs to see what happened
 poolingfunction: mean

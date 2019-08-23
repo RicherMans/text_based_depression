@@ -3,6 +3,7 @@
 import datetime
 import torch
 from pprint import pformat
+import glob
 import models
 from dataset import create_dataloader
 import fire
@@ -14,300 +15,516 @@ import yaml
 import os
 import numpy as np
 from sklearn import metrics
-import tableprint as tp
 import sklearn.preprocessing as pre
-import torchnet as tnt
-
-
-class BinarySimilarMeter(object):
-    """Only counts ones, does not consider zeros as being correct"""
-    def __init__(self, sigmoid_output=False):
-        super(BinarySimilarMeter, self).__init__()
-        self.sigmoid_output = sigmoid_output
-        self.reset()
-
-    def reset(self):
-        self.correct = 0
-        self.n = 0
-
-    def add(self, output, target):
-        if self.sigmoid_output:
-            output = torch.sigmoid(output)
-        target = target.float()
-        output = output.round()
-        self.correct += np.sum(np.logical_and(output, target).numpy())
-        self.n += (target == 1).nonzero().shape[0]
-
-    def value(self):
-        if self.n == 0:
-            return 0
-        return (self.correct / self.n) * 100.
-
-
-class BinaryAccuracyMeter(object):
-    """Counts all outputs, including zero"""
-    def __init__(self, sigmoid_output=False):
-        super(BinaryAccuracyMeter, self).__init__()
-        self.sigmoid_output = sigmoid_output
-        self.reset()
-
-    def reset(self):
-        self.correct = 0
-        self.n = 0
-
-    def add(self, output, target):
-        if self.sigmoid_output:
-            output = torch.sigmoid(output)
-        output = output.float()
-        target = target.float()
-        output = output.round()
-        self.correct += int((output == target).sum())
-        self.n += np.prod(output.shape)
-
-    def value(self):
-        if self.n == 0:
-            return 0
-        return (self.correct / self.n) * 100.
-
-
-def parsecopyfeats(feat, cmvn=False, delta=False, splice=None):
-    outstr = "copy-feats ark:{} ark:- |".format(feat)
-    if cmvn:
-        outstr += "apply-cmvn-sliding --center ark:- ark:- |"
-    if delta:
-        outstr += "add-deltas ark:- ark:- |"
-    if splice and splice > 0:
-        outstr += "splice-feats --left-context={} --right-context={} ark:- ark:- |".format(
-            splice, splice)
-    return outstr
-
-
-def runepoch(dataloader,
-             model,
-             criterion,
-             optimizer=None,
-             dotrain=True,
-             poolfun=lambda x, d: x.mean(d)):
-    model = model.train() if dotrain else model.eval()
-    # By default use average pooling
-    loss_meter = tnt.meter.AverageValueMeter()
-    acc_meter = BinaryAccuracyMeter(sigmoid_output=True)
-    with torch.set_grad_enabled(dotrain):
-        for i, (features, targets) in enumerate(dataloader):
-            features = features.float().to(device)
-            targets = targets.to(device)
-            outputs = model(features)
-            outputs = poolfun(outputs, 1)
-            loss = criterion(outputs, targets).cpu()
-            loss_meter.add(loss.item())
-            acc_meter.add(outputs.cpu().data[:, 1], targets.cpu().data[:, 1])
-            if dotrain:
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-
-    return loss_meter.value(), acc_meter.value()
-
-
-def genlogger(outdir, fname):
-    formatter = logging.Formatter(
-        "[ %(levelname)s : %(asctime)s ] - %(message)s")
-    logging.basicConfig(level=logging.DEBUG,
-                        format="[ %(levelname)s : %(asctime)s ] - %(message)s")
-    logger = logging.getLogger("Pyobj, f")
-    # Dump log to file
-    fh = logging.FileHandler(os.path.join(outdir, fname))
-    fh.setFormatter(formatter)
-    logger.addHandler(fh)
-    return logger
-
-
-def parse_config_or_kwargs(config_file, **kwargs):
-    with open(config_file) as con_read:
-        yaml_config = yaml.load(con_read)
-    # passed kwargs will override yaml config
-    for key in kwargs.keys():
-        assert key in yaml_config, "Parameter {} invalid!".format(key)
-    return dict(yaml_config, **kwargs)
-
-
-def criterion_improver(mode):
-    """Returns a function to ascertain if criterion did improve
-
-    :mode: can be ether 'loss' or 'acc'
-    :returns: function that can be called, function returns true if criterion improved
-
-    """
-    assert mode in ('loss', 'acc')
-    best_value = np.inf if mode == 'loss' else 0
-
-    def comparator(x, best_x):
-        return x < best_x if mode == 'loss' else x > best_x
-
-    def inner(x):
-        # rebind parent scope variable
-        nonlocal best_value
-        if comparator(x, best_value):
-            best_value = x
-            return True
-        return False
-
-    return inner
-
+import uuid
+from tabulate import tabulate
+import sys
+from ignite.contrib.handlers import ProgressBar
+from ignite.engine import (Engine, Events)
+from ignite.handlers import EarlyStopping, ModelCheckpoint
+from ignite.metrics import Accuracy, Loss, RunningAverage, ConfusionMatrix, MeanAbsoluteError, Precision, Recall
+from ignite.contrib.handlers.param_scheduler import LRScheduler
+from torch.optim.lr_scheduler import StepLR
 
 device = 'cpu'
 if torch.cuda.is_available(
 ) and 'SLURM_JOB_PARTITION' in os.environ and 'gpu' in os.environ[
         'SLURM_JOB_PARTITION']:
     device = 'cuda'
-    torch.cuda.manual_seed(0)
-device = torch.device(device)
-torch.manual_seed(0)
-np.random.seed(0)
+    # Without results are slightly inconsistent
+    torch.backends.cudnn.deterministic = True
+DEVICE = torch.device(device)
 
 
-def train(config='config/audio_lstm.yaml', **kwargs):
-    """Trains a model on the given features and vocab.
+class Runner(object):
+    """docstring for Runner"""
+    def __init__(self, seed=0):
+        super(Runner, self).__init__()
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        if device == 'cuda':
+            torch.cuda.manual_seed(seed)
 
-    :features: str: Input features. Needs to be kaldi formatted file
-    :config: A training configuration. Note that all parameters in the config can also be manually adjusted with --ARG=VALUE
-    :returns: None
-    """
+    @staticmethod
+    def _forward(model, batch, poolingfunction):
+        inputs, targets = batch
+        inputs, targets = inputs.float().to(DEVICE), targets.float().to(DEVICE)
+        return poolingfunction(model(inputs), 1), targets
 
-    config_parameters = parse_config_or_kwargs(config, **kwargs)
-    outputdir = os.path.join(
-        config_parameters['outputpath'], config_parameters['model'],
-        datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%f'))
-    try:
-        os.makedirs(outputdir)
-    except IOError:
-        pass
-    logger = genlogger(outputdir, 'train.log')
-    logger.info("Storing data at: {}".format(outputdir))
-    logger.info("<== Passed Arguments ==>")
-    # Print arguments into logs
-    for line in pformat(config_parameters).split('\n'):
-        logger.info(line)
+    def train(self, config, **kwargs):
+        config_parameters = parse_config_or_kwargs(config, **kwargs)
+        outputdir = os.path.join(
+            config_parameters['outputpath'], config_parameters['model'],
+            "{}_{}".format(
+                datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%m'),
+                uuid.uuid1().hex))
+        checkpoint_handler = ModelCheckpoint(
+            outputdir,
+            'run',
+            n_saved=1,
+            require_empty=False,
+            create_dir=True,
+            score_function=lambda engine: -engine.state.metrics['Loss'],
+            save_as_state_dict=False,
+            score_name='loss')
 
-    train_kaldi_string = parsecopyfeats(config_parameters['trainfeatures'],
-                                        **config_parameters['feature_args'])
-    dev_kaldi_string = parsecopyfeats(config_parameters['devfeatures'],
-                                      **config_parameters['feature_args'])
+        train_kaldi_string = parsecopyfeats(
+            config_parameters['trainfeatures'],
+            **config_parameters['feature_args'])
+        dev_kaldi_string = parsecopyfeats(config_parameters['devfeatures'],
+                                          **config_parameters['feature_args'])
+        logger = genlogger(os.path.join(outputdir, 'train.log'))
+        logger.info("Experiment is stored in {}".format(outputdir))
+        for line in pformat(config_parameters).split('\n'):
+            logger.info(line)
+        scaler = getattr(
+            pre,
+            config_parameters['scaler'])(**config_parameters['scaler_args'])
+        inputdim = -1
+        logger.info("<== Estimating Scaler ({}) ==>".format(
+            scaler.__class__.__name__))
+        for _, feat in kaldi_io.read_mat_ark(train_kaldi_string):
+            scaler.partial_fit(feat)
+            inputdim = feat.shape[-1]
+        assert inputdim > 0, "Reading inputstream failed"
+        logger.info("Features: {} Input dimension: {}".format(
+            config_parameters['trainfeatures'], inputdim))
+        logger.info("<== Labels ==>")
+        train_label_df = pd.read_csv(
+            config_parameters['trainlabels']).set_index('Participant_ID')
+        dev_label_df = pd.read_csv(
+            config_parameters['devlabels']).set_index('Participant_ID')
+        train_label_df.index = train_label_df.index.astype(str)
+        dev_label_df.index = dev_label_df.index.astype(str)
+        # target_type = ('PHQ8_Score', 'PHQ8_Binary')
+        target_type = ('PHQ8_Score', 'PHQ8_Binary')
+        n_labels = 3  # PHQ8 (1) + Cross_entropy  (2)
+        # Scores and their respective PHQ8
+        train_labels = train_label_df.loc[:, target_type].T.apply(
+            tuple).to_dict()
+        dev_labels = dev_label_df.loc[:, target_type].T.apply(tuple).to_dict()
+        train_dataloader = create_dataloader(
+            train_kaldi_string,
+            train_labels,
+            transform=scaler.transform,
+            shuffle=True,
+            **config_parameters['dataloader_args'])
+        cv_dataloader = create_dataloader(
+            dev_kaldi_string,
+            dev_labels,
+            transform=scaler.transform,
+            shuffle=False,
+            **config_parameters['dataloader_args'])
+        model = getattr(models, config_parameters['model'])(
+            inputdim=inputdim,
+            output_size=n_labels,
+            **config_parameters['model_args'])
+        if 'pretrain' in config_parameters:
+            logger.info("Loading pretrained model {}".format(
+                config_parameters['pretrain']))
+            pretrained_model = torch.load(config_parameters['pretrain'],
+                                          map_location=lambda st, loc: st)
+            if 'Attn' in pretrained_model.__class__.__name__:
+                model.lstm.load_state_dict(pretrained_model.lstm.state_dict())
+            else:
+                model.net.load_state_dict(pretrained_model.net.state_dict())
+        logger.info("<== Model ==>")
+        for line in pformat(model).split('\n'):
+            logger.info(line)
+        criterion = getattr(
+            losses,
+            config_parameters['loss'])(**config_parameters['loss_args'])
+        optimizer = getattr(torch.optim, config_parameters['optimizer'])(
+            model.parameters(), **config_parameters['optimizer_args'])
+        poolingfunction = parse_poolingfunction(
+            config_parameters['poolingfunction'])
+        criterion = criterion.to(device)
+        model = model.to(device)
 
-    scaler = getattr(
-        pre, config_parameters['scaler'])(**config_parameters['scaler_args'])
-    inputdim = -1
-    logger.info("<== Estimating Scaler ({}) ==>".format(
-        scaler.__class__.__name__))
-    for kid, feat in kaldi_io.read_mat_ark(train_kaldi_string):
-        scaler.partial_fit(feat)
-        inputdim = feat.shape[-1]
-    assert inputdim > 0, "Reading inputstream failed"
-    logger.info("Features: {} Input dimension: {}".format(
-        config_parameters['trainfeatures'], inputdim))
-    logger.info("<== Labels ==>")
-    train_label_df = pd.read_csv(
-        config_parameters['trainlabels']).set_index('Participant_ID')
-    dev_label_df = pd.read_csv(
-        config_parameters['devlabels']).set_index('Participant_ID')
-    train_label_df.index = train_label_df.index.astype(str)
-    dev_label_df.index = dev_label_df.index.astype(str)
+        def _train_batch(_, batch):
+            model.train()
+            with torch.enable_grad():
+                optimizer.zero_grad()
+                outputs, targets = Runner._forward(model, batch,
+                                                   poolingfunction)
+                loss = criterion(outputs, targets)
+                loss.backward()
+                optimizer.step()
+                return loss.item()
 
-    target_type = ('PHQ8_Score', 'PHQ8_Binary')
+        def _inference(_, batch):
+            model.eval()
+            with torch.no_grad():
+                return Runner._forward(model, batch, poolingfunction)
 
-    # Scores and their respective
-    train_labels = train_label_df.loc[:, target_type].T.apply(tuple).to_dict()
-    dev_labels = dev_label_df.loc[:, target_type].T.apply(tuple).to_dict()
-    n_labels = len(target_type)
+        def meter_transform(output):
+            y_pred, y = output
+            # y_pred is of shape [Bx3] (0 = MSE, 1+2 = Xent)
+            # y = is of shape [Bx2] (0=Mse, 1 = Xent)
+            return y_pred[:, 1:3], y[:, 1].long()
 
-    train_dataloader = create_dataloader(
-        train_kaldi_string,
-        train_labels,
-        transform=scaler.transform,
-        **config_parameters['dataloader_args'])
-    cv_dataloader = create_dataloader(dev_kaldi_string,
-                                      dev_labels,
-                                      transform=scaler.transform,
-                                      **config_parameters['dataloader_args'])
-    model = getattr(models, config_parameters['model'])(
-        inputdim=inputdim,
-        output_size=n_labels,
-        **config_parameters['model_args'])
-    logger.info("<== Model ==>")
-    for line in pformat(model).split('\n'):
-        logger.info(line)
-    model = model.to(device)
-    optimizer = getattr(torch.optim, config_parameters['optimizer'])(
-        model.parameters(), **config_parameters['optimizer_args'])
+        precision = Precision(output_transform=meter_transform, average=False)
+        recall = Recall(output_transform=meter_transform, average=False)
+        F1 = (precision * recall * 2 / (precision + recall)).mean()
+        metrics = {
+            'Loss':
+            Loss(criterion),
+            'Accuracy':
+            Accuracy(output_transform=meter_transform),
+            'Recall':
+            Recall(output_transform=meter_transform, average=True),
+            'Precision':
+            Precision(output_transform=meter_transform, average=True),
+            'MAE':
+            MeanAbsoluteError(
+                output_transform=lambda out: (out[0][:, 0], out[1][:, 0])),
+            'F1':
+            F1
+        }
 
-    scheduler = getattr(torch.optim.lr_scheduler,
-                        config_parameters['scheduler'])(
-                            optimizer, **config_parameters['scheduler_args'])
-    criterion = getattr(
-        losses, config_parameters['loss'])(**config_parameters['loss_args'])
-    criterion.to(device)
+        train_engine = Engine(_train_batch)
+        inference_engine = Engine(_inference)
+        for name, metric in metrics.items():
+            metric.attach(inference_engine, name)
+        RunningAverage(output_transform=lambda x: x).attach(
+            train_engine, 'run_loss')
+        pbar = ProgressBar(persist=False)
+        pbar.attach(train_engine, ['run_loss'])
 
-    trainedmodelpath = os.path.join(outputdir, 'model.th')
+        scheduler = getattr(torch.optim.lr_scheduler,
+                            config_parameters['scheduler'])(
+                                optimizer,
+                                **config_parameters['scheduler_args'])
+        early_stop_handler = EarlyStopping(
+            patience=5,
+            score_function=lambda engine: -engine.state.metrics['Loss'],
+            trainer=train_engine)
+        inference_engine.add_event_handler(Events.EPOCH_COMPLETED,
+                                           early_stop_handler)
+        inference_engine.add_event_handler(Events.EPOCH_COMPLETED,
+                                           checkpoint_handler, {
+                                               'model': model,
+                                               'scaler': scaler,
+                                               'config': config_parameters
+                                           })
 
-    criterion_improved = criterion_improver(
-        config_parameters['improvecriterion'])
-    header = [
-        'Epoch',
-        'Loss(T)',
-        'Loss(CV)',
-        "Acc(T)",
-        "Acc(CV)",
-    ]
-    for line in tp.header(header, style='grid').split('\n'):
-        logger.info(line)
+        @train_engine.on(Events.EPOCH_COMPLETED)
+        def compute_metrics(engine):
+            inference_engine.run(cv_dataloader)
+            validation_string_list = [
+                "Validation Results - Epoch: {:<3}".format(engine.state.epoch)
+            ]
+            for metric in metrics:
+                validation_string_list.append("{}: {:<5.2f}".format(
+                    metric, inference_engine.state.metrics[metric]))
+            logger.info(" ".join(validation_string_list))
+            logger.info("\n")
 
-    poolingfunction_name = config_parameters['poolingfunction']
-    pooling_function = parse_poolingfunction(poolingfunction_name)
-    for epoch in range(1, config_parameters['epochs'] + 1):
-        train_utt_loss_mean_std, train_utt_acc = runepoch(
-            train_dataloader,
-            model,
-            criterion,
-            optimizer,
-            dotrain=True,
-            poolfun=pooling_function)
-        cv_utt_loss_mean_std, cv_utt_acc = runepoch(cv_dataloader,
-                                                    model,
-                                                    criterion,
-                                                    dotrain=False,
-                                                    poolfun=pooling_function)
-        logger.info(
-            tp.row((epoch, ) +
-                   (train_utt_loss_mean_std[0], cv_utt_loss_mean_std[0],
-                    train_utt_acc, cv_utt_acc),
-                   style='grid'))
-        epoch_meanloss = cv_utt_loss_mean_std[0]
-        if epoch % config_parameters['saveinterval'] == 0:
-            torch.save(
+            pbar.n = pbar.last_print_n = 0
+
+        @inference_engine.on(Events.COMPLETED)
+        def update_reduce_on_plateau(engine):
+            val_loss = engine.state.metrics['Loss']
+            if 'ReduceLROnPlateau' == scheduler.__class__.__name__:
+                scheduler.step(val_loss)
+            else:
+                scheduler.step()
+
+        train_engine.run(train_dataloader,
+                         max_epochs=config_parameters['epochs'])
+        # Return for further processing
+        return outputdir
+
+    def autoencoder(self, config, **kwargs):
+        config_parameters = parse_config_or_kwargs(config, **kwargs)
+        outputdir = os.path.join(
+            config_parameters['outputpath'], config_parameters['model'],
+            "{}_{}".format(
+                datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%m'),
+                uuid.uuid1().hex))
+        checkpoint_handler = ModelCheckpoint(
+            outputdir,
+            'run',
+            n_saved=1,
+            require_empty=False,
+            create_dir=True,
+            score_function=lambda engine: -engine.state.metrics['Loss'],
+            save_as_state_dict=False,
+            score_name='loss')
+
+        train_kaldi_string = parsecopyfeats(
+            config_parameters['trainfeatures'],
+            **config_parameters['feature_args'])
+        dev_kaldi_string = parsecopyfeats(config_parameters['devfeatures'],
+                                          **config_parameters['feature_args'])
+        logger = genlogger(os.path.join(outputdir, 'train.log'))
+        logger.info("Experiment is stored in {}".format(outputdir))
+        for line in pformat(config_parameters).split('\n'):
+            logger.info(line)
+        scaler = getattr(
+            pre,
+            config_parameters['scaler'])(**config_parameters['scaler_args'])
+        inputdim = -1
+        logger.info("<== Estimating Scaler ({}) ==>".format(
+            scaler.__class__.__name__))
+        train_labels_dummy = {}
+        for k, feat in kaldi_io.read_mat_ark(train_kaldi_string):
+            scaler.partial_fit(feat)
+            inputdim = feat.shape[-1]
+            train_labels_dummy[k] = np.empty(1)
+        assert inputdim > 0, "Reading inputstream failed"
+        logger.info("Features: {} Input dimension: {}".format(
+            config_parameters['trainfeatures'], inputdim))
+        train_dataloader = create_dataloader(
+            train_kaldi_string,
+            train_labels_dummy,
+            transform=scaler.transform,
+            shuffle=False,
+            **config_parameters['dataloader_args'])
+        model = models.AutoEncoderLSTM(inputdim)
+        logger.info("<== Model ==>")
+        for line in pformat(model).split('\n'):
+            logger.info(line)
+        criterion = losses.MSELoss()
+        optimizer = getattr(torch.optim, config_parameters['optimizer'])(
+            model.parameters(), **config_parameters['optimizer_args'])
+        criterion = criterion.to(device)
+        model = model.to(device)
+
+        def _train_batch(_, batch):
+            model.train()
+            with torch.enable_grad():
+                input_x, _ = batch
+                optimizer.zero_grad()
+                outputs = model(input_x)
+                loss = criterion(outputs, input_x)
+                loss.backward()
+                optimizer.step()
+                return loss.item()
+
+        def _inference(_, batch):
+            model.eval()
+            with torch.no_grad():
+                x, _ = batch
+                o = model(x)
+                return o, x
+
+        metrics = {
+            'Loss': Loss(criterion),
+        }
+
+        train_engine = Engine(_train_batch)
+        inference_engine = Engine(_inference)
+        for name, metric in metrics.items():
+            metric.attach(inference_engine, name)
+        RunningAverage(output_transform=lambda x: x).attach(
+            train_engine, 'run_loss')
+        pbar = ProgressBar(persist=False)
+        pbar.attach(train_engine, ['run_loss'])
+
+        step_scheduler = StepLR(optimizer, step_size=100, gamma=0.5)
+        scheduler = LRScheduler(step_scheduler)
+        train_engine.add_event_handler(Events.ITERATION_STARTED, scheduler)
+        early_stop_handler = EarlyStopping(
+            patience=1,
+            score_function=lambda engine: -engine.state.metrics['Loss'],
+            trainer=train_engine)
+        inference_engine.add_event_handler(Events.EPOCH_COMPLETED,
+                                           early_stop_handler)
+        inference_engine.add_event_handler(Events.EPOCH_COMPLETED,
+                                           checkpoint_handler, {
+                                               'model': model,
+                                               'scaler': scaler,
+                                               'config': config_parameters
+                                           })
+
+        @train_engine.on(Events.EPOCH_COMPLETED)
+        def compute_metrics(engine):
+            inference_engine.run(train_dataloader)
+            validation_string_list = [
+                "Train Results - Epoch: {:<3}".format(engine.state.epoch)
+            ]
+            for metric in metrics:
+                validation_string_list.append("{}: {:<5.2f}".format(
+                    metric, inference_engine.state.metrics[metric]))
+            logger.info(" ".join(validation_string_list))
+            logger.info("\n")
+
+            pbar.n = pbar.last_print_n = 0
+
+        train_engine.run(train_dataloader,
+                         max_epochs=config_parameters['epochs'])
+        # Return for further processing
+        return outputdir
+
+    def evaluate(self,
+                 experiment_path: str,
+                 outputfile: str = 'results.csv',
+                 **kwargs):
+        """Prints out the stats for the given model ( MAE, RMSE, F1, Pre, Rec)
+
+
+        """
+        config = torch.load(glob.glob(
+            "{}/run_config*".format(experiment_path))[0],
+                            map_location=lambda storage, loc: storage)
+        model = torch.load(glob.glob(
+            "{}/run_model*".format(experiment_path))[0],
+                           map_location=lambda storage, loc: storage)
+        scaler = torch.load(glob.glob(
+            "{}/run_scaler*".format(experiment_path))[0],
+                            map_location=lambda storage, loc: storage)
+        config_parameters = dict(config, **kwargs)
+        dev_features = config_parameters['devfeatures']
+        dev_label_df = pd.read_csv(
+            config_parameters['devlabels']).set_index('Participant_ID')
+        dev_label_df.index = dev_label_df.index.astype(str)
+
+        dev_labels = dev_label_df.loc[:, ['PHQ8_Score', 'PHQ8_Binary'
+                                          ]].T.apply(tuple).to_dict()
+        outputfile = os.path.join(experiment_path, outputfile)
+        y_score_true, y_score_pred, y_binary_pred, y_binary_true = [], [], [], []
+
+        poolingfunction = parse_poolingfunction(
+            config_parameters['poolingfunction'])
+        dataloader = create_dataloader(dev_features,
+                                       dev_labels,
+                                       transform=scaler.transform,
+                                       batch_size=1,
+                                       num_workers=2,
+                                       shuffle=False)
+
+        model = model.to(device)
+        with torch.no_grad():
+            for batch in dataloader:
+                output, target = Runner._forward(model, batch, poolingfunction)
+                y_score_pred.append(output[:, 0].cpu().numpy())
+                y_score_true.append(target[:, 0].cpu().numpy())
+                y_binary_pred.append(
+                    torch.argmax(output[:, 1:3], dim=1).cpu().numpy())
+                y_binary_true.append(target[:, 1].cpu().numpy())
+        y_score_true = np.concatenate(y_score_true)
+        y_score_pred = np.concatenate(y_score_pred)
+        y_binary_pred = np.concatenate(y_binary_pred)
+        y_binary_true = np.concatenate(y_binary_true)
+
+        with open(outputfile, 'w') as wp:
+            pre = metrics.precision_score(y_binary_true,
+                                          y_binary_pred,
+                                          average='macro')
+            rec = metrics.recall_score(y_binary_true,
+                                       y_binary_pred,
+                                       average='macro')
+            f1 = 2 * pre * rec / (pre + rec)
+            rmse = np.sqrt(
+                metrics.mean_squared_error(y_score_true, y_score_pred))
+            mae = metrics.mean_absolute_error(y_score_true, y_score_pred)
+            df = pd.DataFrame(
                 {
-                    'model': model,
-                    'scaler': scaler,
-                    # 'encoder': many_hot_encoder,
-                    'config': config_parameters
+                    'precision': pre,
+                    'recall': rec,
+                    'F1': f1,
+                    'MAE': mae,
+                    'RMSE': rmse
                 },
-                os.path.join(outputdir, 'model_{}.th'.format(epoch)))
-        # ReduceOnPlateau needs a value to work
-        schedarg = epoch_meanloss if scheduler.__class__.__name__ == 'ReduceLROnPlateau' else None
-        scheduler.step(schedarg)
-        if criterion_improved(epoch_meanloss):
-            torch.save(
-                {
-                    'model': model,
-                    'scaler': scaler,
-                    # 'encoder': many_hot_encoder,
-                    'config': config_parameters
-                },
-                trainedmodelpath)
-        if optimizer.param_groups[0]['lr'] < 1e-7:
-            break
-    logger.info(tp.bottom(len(header), style='grid'))
-    logger.info("Results are in: {}".format(outputdir))
-    return outputdir
+                index=["Macro"])
+            df.to_csv(wp, index=False)
+            print(tabulate(df, headers='keys'))
+        return df
+
+    def evaluates(
+            self,
+            *experiment_paths: str,
+            outputfile: str = 'scores.csv',
+            num_workers: int = 2,
+    ):
+        result_dfs = []
+        for exp_path in experiment_paths:
+            print("Evaluating {}".format(exp_path))
+            result_df = self.evaluate(exp_path)
+            exp_config = torch.load(glob.glob(
+                "{}/run_config*".format(exp_path))[0],
+                                    map_location=lambda storage, loc: storage)
+            result_df['exp'] = os.path.basename(exp_path)
+            result_df['model'] = exp_config['model']
+            result_df['optimizer'] = exp_config['optimizer']
+            result_df['batch_size'] = exp_config['dataloader_args'][
+                'batch_size']
+            result_df['poolingfunction'] = exp_config['poolingfunction']
+            result_df['loss'] = exp_config['loss']
+            result_dfs.append(result_df)
+        df = pd.concat(result_dfs)
+        df.sort_values(by='F1', ascending=False, inplace=True)
+
+        with open(outputfile, 'w') as wp:
+            df.to_csv(wp, index=False)
+            print(tabulate(df, headers='keys', tablefmt="pipe"))
+
+    def check_dataloader(self, config, **kwargs):
+        config_parameters = parse_config_or_kwargs(config, **kwargs)
+        train_label_df = pd.read_csv(
+            config_parameters['trainlabels']).set_index('Participant_ID')
+        train_label_df.index = train_label_df.index.astype(str)
+        # target_type = ('PHQ8_Score', 'PHQ8_Binary')
+        target_type = ('PHQ8_Score', 'PHQ8_Binary')
+        # Scores and their respective PHQ8
+        train_labels = train_label_df.loc[:, target_type].T.apply(
+            tuple).to_dict()
+        train_kaldi_string = parsecopyfeats(
+            config_parameters['trainfeatures'],
+            **config_parameters['feature_args'])
+        train_dataloader = create_dataloader(
+            train_kaldi_string,
+            train_labels,
+            transform=lambda x: x,
+            shuffle=True,
+            **config_parameters['dataloader_args'])
+        stat = []
+        for a, b in train_dataloader:
+            stat.append(b.squeeze())
+        stat = torch.stack(stat).numpy()
+        print(stat)
+
+
+def parsecopyfeats(feat, cmvn=False, delta=False, splice=None):
+    # Check if user has kaldi installed, otherwise just use kaldi_io (without extra transformations)
+    import shutil
+    if shutil.which('copy-feats') is None:
+        return feat
+    else:
+        outstr = "copy-feats ark:{} ark:- |".format(feat)
+        if cmvn:
+            outstr += "apply-cmvn-sliding --center ark:- ark:- |"
+        if delta:
+            outstr += "add-deltas ark:- ark:- |"
+        if splice and splice > 0:
+            outstr += "splice-feats --left-context={} --right-context={} ark:- ark:- |".format(
+                splice, splice)
+    return outstr
+
+
+def genlogger(outputfile):
+    formatter = logging.Formatter(
+        "[ %(levelname)s : %(asctime)s ] - %(message)s")
+    logger = logging.getLogger(__name__ + "." + outputfile)
+    logger.setLevel(logging.INFO)
+    stdlog = logging.StreamHandler(sys.stdout)
+    stdlog.setFormatter(formatter)
+    file_handler = logging.FileHandler(outputfile)
+    file_handler.setFormatter(formatter)
+    # Log to stdout
+    logger.addHandler(file_handler)
+    logger.addHandler(stdlog)
+    return logger
+
+
+def parse_config_or_kwargs(config_file, **kwargs):
+    with open(config_file) as con_read:
+        yaml_config = yaml.load(con_read, Loader=yaml.FullLoader)
+    # passed kwargs will override yaml config
+    # for key in kwargs.keys():
+    # assert key in yaml_config, "Parameter {} invalid!".format(key)
+    return dict(yaml_config, **kwargs)
 
 
 def parse_poolingfunction(poolingfunction_name='mean'):
@@ -327,7 +544,7 @@ def parse_poolingfunction(poolingfunction_name='mean'):
 
         def pooling_function(x, d):
             return (x.exp() * x).sum(d) / x.exp().sum(d)
-    elif poolingfunction_name == 'time':  # Last timestep
+    elif poolingfunction_name == 'last':  # Last timestep
 
         def pooling_function(x, d):
             return x.select(d, -1)
@@ -335,6 +552,9 @@ def parse_poolingfunction(poolingfunction_name='mean'):
 
         def pooling_function(x, d):
             return x.select(d, 0)
+    else:
+        raise ValueError(
+            "Pooling function {} not available".format(poolingfunction_name))
 
     return pooling_function
 
@@ -363,7 +583,8 @@ def _extract_features_from_model(model, features, scaler=None):
 
 
 def extract_features(model_path: str, features='trainfeatures'):
-    modeldump = torch.load(model_path, lambda storage, loc: storage)
+    modeldump = torch.load(model_path,
+                           map_location=lambda storage, loc: storage)
     model_dir = os.path.dirname(model_path)
     config_parameters = modeldump['config']
     dev_features = config_parameters[features]
@@ -381,200 +602,5 @@ def extract_features(model_path: str, features='trainfeatures'):
     return outputfile
 
 
-def stats(model_path: str, outputfile: str = 'stats.txt', cutoff: int = None):
-    """Prints out the stats for the given model ( MAE, RMSE, F1, Pre, Rec)
-
-    :model_path:str: TODO
-    :returns: TODO
-
-    """
-    from tabulate import tabulate
-    modeldump = torch.load(model_path, lambda storage, loc: storage)
-    model_dir = os.path.dirname(model_path)
-    config_parameters = modeldump['config']
-    dev_features = config_parameters['devfeatures']
-    dev_label_df = pd.read_csv(
-        config_parameters['devlabels']).set_index('Participant_ID')
-    dev_label_df.index = dev_label_df.index.astype(str)
-
-    dev_labels = dev_label_df.loc[:, ['PHQ8_Score', 'PHQ8_Binary']].T.apply(
-        tuple).to_dict()
-    outputfile = os.path.join(model_dir, outputfile)
-    y_score_true, y_score_pred, y_binary_pred, y_binary_true = [], [], [], []
-    scores = _forward_model(model_path, dev_features, cutoff=cutoff)
-    for key, score in scores.items():
-        score_pred, binary_pred = torch.chunk(score, 2, dim=-1)
-        y_score_pred.append(score_pred.numpy())
-        y_score_true.append(dev_labels[key][0])
-        y_binary_pred.append(
-            torch.sigmoid(binary_pred).round().numpy().astype(int).item())
-        y_binary_true.append(dev_labels[key][1])
-
-    with open(outputfile, 'w') as wp:
-        pre = metrics.precision_score(y_binary_true,
-                                      y_binary_pred,
-                                      average='macro')
-        rec = metrics.recall_score(y_binary_true,
-                                   y_binary_pred,
-                                   average='macro')
-        f1 = 2 * pre * rec / (pre + rec)
-        rmse = np.sqrt(metrics.mean_squared_error(y_score_true, y_score_pred))
-        mae = metrics.mean_absolute_error(y_score_true, y_score_pred)
-        df = pd.DataFrame(
-            {
-                'precision': pre,
-                'recall': rec,
-                'F1': f1,
-                'MAE': mae,
-                'RMSE': rmse
-            },
-            index=["Macro"])
-        print(tabulate(df, headers='keys'), file=wp)
-        print(tabulate(df, headers='keys'))
-
-
-def fuse(model_paths: list, outputfile='scores.txt', cutoff: int = None):
-    from tabulate import tabulate
-    scores = []
-    for model_path in model_paths:
-        modeldump = torch.load(model_path, lambda storage, loc: storage)
-        config_parameters = modeldump['config']
-        dev_features = config_parameters['devfeatures']
-        dev_label_df = pd.read_csv(
-            config_parameters['devlabels']).set_index('Participant_ID')
-        dev_label_df.index = dev_label_df.index.astype(str)
-        score = _forward_model(model_path, dev_features, cutoff=cutoff)
-        for speaker, pred_score in score.items():
-            scores.append({
-                'speaker':
-                speaker,
-                'MAE':
-                float(pred_score[0].numpy()),
-                'binary':
-                float(torch.sigmoid(pred_score[1]).numpy()),
-                'model':
-                model_path,
-                'binary_true':
-                dev_label_df.loc[speaker, 'PHQ8_Binary'],
-                'MAE_true':
-                dev_label_df.loc[speaker, 'PHQ8_Score']
-            })
-    df = pd.DataFrame(scores)
-
-    spkmeans = df.groupby('speaker')[[
-        'MAE', 'MAE_true', 'binary', 'binary_true'
-    ]].mean()
-    spkmeans['binary'] = spkmeans['binary'] > 0.5
-
-    with open(outputfile, 'w') as wp:
-        pre = metrics.precision_score(spkmeans['binary_true'].values,
-                                      spkmeans['binary'].values,
-                                      average='macro')
-        rec = metrics.recall_score(spkmeans['binary_true'].values,
-                                   spkmeans['binary'].values,
-                                   average='macro')
-        f1 = 2 * pre * rec / (pre + rec)
-        rmse = np.sqrt(
-            metrics.mean_squared_error(spkmeans['MAE_true'].values,
-                                       spkmeans['MAE'].values))
-        mae = metrics.mean_absolute_error(spkmeans['MAE_true'].values,
-                                          spkmeans['MAE'].values)
-        df = pd.DataFrame(
-            {
-                'precision': pre,
-                'recall': rec,
-                'F1': f1,
-                'MAE': mae,
-                'RMSE': rmse
-            },
-            index=["Macro"])
-        print(tabulate(df, headers='keys'), file=wp)
-        print(tabulate(df, headers='keys'))
-
-
-def _forward_model(model_path: str,
-                   features: str,
-                   dopooling: bool = True,
-                   cutoff=None):
-    modeldump = torch.load(model_path, lambda storage, loc: storage)
-    scaler = modeldump['scaler']
-    config_parameters = modeldump['config']
-    pooling_function = parse_poolingfunction(
-        config_parameters['poolingfunction'])
-    kaldi_string = parsecopyfeats(features,
-                                  **config_parameters['feature_args'])
-    ret = {}
-
-    with torch.no_grad():
-        model = modeldump['model'].to(device).eval()
-        for key, feat in kaldi_io.read_mat_ark(kaldi_string):
-            feat = scaler.transform(feat)
-            if cutoff:
-                # Cut all after cutoff
-                feat = feat[:cutoff]
-            feat = torch.from_numpy(feat).to(device).unsqueeze(0)
-            output = model(feat).cpu()
-            if dopooling:
-                output = pooling_function(output, 1).squeeze(0)
-            ret[key] = output
-    return ret
-
-
-def trainstats(config: str = 'config/audio_lstm.yaml', **kwargs):
-    """Runs training and then prints dev stats
-
-    :config:str: config file
-    :**kwargs: Extra overwrite configs
-    :returns: None
-
-    """
-    output_model = train(config, **kwargs)
-    best_model = os.path.join(output_model, 'model.th')
-    stats(best_model)
-
-
-def run_search(config: str = 'config/audio_lstm.yaml',
-               lr=0.1,
-               mom=0.9,
-               nest=False,
-               **kwargs):
-    """Runs training and then prints dev stats
-
-    :config:str: config file
-    :**kwargs: Extra overwrite configs
-    :returns: None
-
-    """
-    optimizer_args = {'lr': lr, 'momentum': mom, 'nesterov': nest}
-    kwargs['optimizer_args'] = optimizer_args
-    output_model = train(config, **kwargs)
-    best_model = os.path.join(output_model, 'model.th')
-    stats(best_model)
-
-
-def run_search_adam(config: str = 'config/audio_lstm.yaml', lr=0.1, **kwargs):
-    """Runs training and then prints dev stats
-
-    :config:str: config file
-    :**kwargs: Extra overwrite configs
-    :returns: None
-
-    """
-    optimizer_args = {'lr': lr}
-    kwargs['optimizer_args'] = optimizer_args
-    output_model = train(config, **kwargs)
-    best_model = os.path.join(output_model, 'model.th')
-    stats(best_model)
-
-
 if __name__ == '__main__':
-    fire.Fire({
-        'train': train,
-        'stats': stats,
-        'trainstats': trainstats,
-        'search': run_search,
-        'searchadam': run_search_adam,
-        'ex': extract_features,
-        'fwd': _forward_model,
-        'fuse': fuse,
-    })
+    fire.Fire(Runner)
