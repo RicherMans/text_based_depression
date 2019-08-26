@@ -85,14 +85,14 @@ def create_dataloader(kaldi_string,
     assert len(features) > 0, "No features were found, are the labels correct?"
     # Shuffling means that this is training dataset, so oversample
     if shuffle:
-        random_oversampler = RandomOverSampler(random_state=0)
+        sampler = RandomOverSampler()
         # Assume that label is Score, Binary, we take the binary to oversample
         sample_index = 1 if len(labels[0]) == 2 else 0
         # Dummy X data, y is the binary label
-        _, _ = random_oversampler.fit_resample(torch.ones(
-            len(features), 1), [l[sample_index] for l in labels])
+        _, _ = sampler.fit_resample(torch.ones(len(features), 1),
+                                    [l[sample_index] for l in labels])
         # Get the indices for the sampled data
-        indicies = random_oversampler.sample_indices_
+        indicies = sampler.sample_indices_
         # reindex, new data is oversampled in the minority class
         features, labels = [features[id] for id in indicies
                             ], [labels[id] for id in indicies]

@@ -483,7 +483,7 @@ class Runner(object):
         for a, b in train_dataloader:
             stat.append(b.squeeze())
         stat = torch.stack(stat).numpy()
-        print(stat)
+        print(np.unique(stat, return_counts=True, axis=0))
 
 
 def parsecopyfeats(feat, cmvn=False, delta=False, splice=None):

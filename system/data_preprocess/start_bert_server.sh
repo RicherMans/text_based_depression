@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
+model_dir=${1:-"./bert_models"}
 node=$(hostname -s)
 
-echo "Please Connecto to ${node}"
+echo "Please Connect to ${node}"
 
-bert-serving-start -model_dir ./bert_models -num_worker=1 -max_seq_len=125
+bert-serving-start -model_dir ${model_dir} -num_worker=2 -max_seq_len=125
