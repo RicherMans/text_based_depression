@@ -235,128 +235,6 @@ class Runner(object):
         # Return for further processing
         return outputdir
 
-    def autoencoder(self, config, **kwargs):
-        config_parameters = parse_config_or_kwargs(config, **kwargs)
-        outputdir = os.path.join(
-            config_parameters['outputpath'], config_parameters['model'],
-            "{}_{}".format(
-                datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%m'),
-                uuid.uuid1().hex))
-        checkpoint_handler = ModelCheckpoint(
-            outputdir,
-            'run',
-            n_saved=1,
-            require_empty=False,
-            create_dir=True,
-            score_function=lambda engine: -engine.state.metrics['Loss'],
-            save_as_state_dict=False,
-            score_name='loss')
-
-        train_kaldi_string = parsecopyfeats(
-            config_parameters['trainfeatures'],
-            **config_parameters['feature_args'])
-        dev_kaldi_string = parsecopyfeats(config_parameters['devfeatures'],
-                                          **config_parameters['feature_args'])
-        logger = genlogger(os.path.join(outputdir, 'train.log'))
-        logger.info("Experiment is stored in {}".format(outputdir))
-        for line in pformat(config_parameters).split('\n'):
-            logger.info(line)
-        scaler = getattr(
-            pre,
-            config_parameters['scaler'])(**config_parameters['scaler_args'])
-        inputdim = -1
-        logger.info("<== Estimating Scaler ({}) ==>".format(
-            scaler.__class__.__name__))
-        train_labels_dummy = {}
-        for k, feat in kaldi_io.read_mat_ark(train_kaldi_string):
-            scaler.partial_fit(feat)
-            inputdim = feat.shape[-1]
-            train_labels_dummy[k] = np.empty(1)
-        assert inputdim > 0, "Reading inputstream failed"
-        logger.info("Features: {} Input dimension: {}".format(
-            config_parameters['trainfeatures'], inputdim))
-        train_dataloader = create_dataloader(
-            train_kaldi_string,
-            train_labels_dummy,
-            transform=scaler.transform,
-            shuffle=False,
-            **config_parameters['dataloader_args'])
-        model = models.AutoEncoderLSTM(inputdim)
-        logger.info("<== Model ==>")
-        for line in pformat(model).split('\n'):
-            logger.info(line)
-        criterion = losses.MSELoss()
-        optimizer = getattr(torch.optim, config_parameters['optimizer'])(
-            model.parameters(), **config_parameters['optimizer_args'])
-        criterion = criterion.to(device)
-        model = model.to(device)
-
-        def _train_batch(_, batch):
-            model.train()
-            with torch.enable_grad():
-                input_x, _ = batch
-                optimizer.zero_grad()
-                outputs = model(input_x)
-                loss = criterion(outputs, input_x)
-                loss.backward()
-                optimizer.step()
-                return loss.item()
-
-        def _inference(_, batch):
-            model.eval()
-            with torch.no_grad():
-                x, _ = batch
-                o = model(x)
-                return o, x
-
-        metrics = {
-            'Loss': Loss(criterion),
-        }
-
-        train_engine = Engine(_train_batch)
-        inference_engine = Engine(_inference)
-        for name, metric in metrics.items():
-            metric.attach(inference_engine, name)
-        RunningAverage(output_transform=lambda x: x).attach(
-            train_engine, 'run_loss')
-        pbar = ProgressBar(persist=False)
-        pbar.attach(train_engine, ['run_loss'])
-
-        step_scheduler = StepLR(optimizer, step_size=100, gamma=0.5)
-        scheduler = LRScheduler(step_scheduler)
-        train_engine.add_event_handler(Events.ITERATION_STARTED, scheduler)
-        early_stop_handler = EarlyStopping(
-            patience=1,
-            score_function=lambda engine: -engine.state.metrics['Loss'],
-            trainer=train_engine)
-        inference_engine.add_event_handler(Events.EPOCH_COMPLETED,
-                                           early_stop_handler)
-        inference_engine.add_event_handler(Events.EPOCH_COMPLETED,
-                                           checkpoint_handler, {
-                                               'model': model,
-                                               'scaler': scaler,
-                                               'config': config_parameters
-                                           })
-
-        @train_engine.on(Events.EPOCH_COMPLETED)
-        def compute_metrics(engine):
-            inference_engine.run(train_dataloader)
-            validation_string_list = [
-                "Train Results - Epoch: {:<3}".format(engine.state.epoch)
-            ]
-            for metric in metrics:
-                validation_string_list.append("{}: {:<5.2f}".format(
-                    metric, inference_engine.state.metrics[metric]))
-            logger.info(" ".join(validation_string_list))
-            logger.info("\n")
-
-            pbar.n = pbar.last_print_n = 0
-
-        train_engine.run(train_dataloader,
-                         max_epochs=config_parameters['epochs'])
-        # Return for further processing
-        return outputdir
-
     def evaluate(self,
                  experiment_path: str,
                  outputfile: str = 'results.csv',
@@ -394,7 +272,7 @@ class Runner(object):
                                        num_workers=2,
                                        shuffle=False)
 
-        model = model.to(device)
+        model = model.to(device).eval()
         with torch.no_grad():
             for batch in dataloader:
                 output, target = Runner._forward(model, batch, poolingfunction)
@@ -557,49 +435,6 @@ def parse_poolingfunction(poolingfunction_name='mean'):
             "Pooling function {} not available".format(poolingfunction_name))
 
     return pooling_function
-
-
-def _extract_features_from_model(model, features, scaler=None):
-    if model.__class__.__name__ == 'LSTM':
-        fwdmodel = torch.nn.Sequential(model.net)
-    elif model.__class__.__name__ == 'LSTMSimpleAttn':
-        fwdmodel = torch.nn.Sequential(model)
-    elif model.__class__.__name__ == 'TCN':
-        fwdmodel = None
-    else:
-        assert False, "Model not prepared for extraction"
-    ret = {}
-    with torch.no_grad():
-        model = model.to(device)
-        for k, v in kaldi_io.read_mat_ark(features):
-            if scaler:
-                v = scaler.transform(v)
-            v = torch.from_numpy(v).to(device).unsqueeze(0)
-            out = fwdmodel(v)
-            if isinstance(out, tuple):  # LSTM output, 2 values hidden,and x
-                out = out[0]
-            ret[k] = out.cpu().squeeze().numpy()
-    return ret
-
-
-def extract_features(model_path: str, features='trainfeatures'):
-    modeldump = torch.load(model_path,
-                           map_location=lambda storage, loc: storage)
-    model_dir = os.path.dirname(model_path)
-    config_parameters = modeldump['config']
-    dev_features = config_parameters[features]
-    scaler = modeldump['scaler']
-    model = modeldump['model']
-
-    outputfile = os.path.join(model_dir, features + '.ark')
-    dev_features = parsecopyfeats(dev_features,
-                                  **config_parameters['feature_args'])
-
-    vectors = _extract_features_from_model(model, dev_features, scaler)
-    with open(outputfile, 'wb') as wp:
-        for key, vector in vectors.items():
-            kaldi_io.write_mat(wp, vector, key=key)
-    return outputfile
 
 
 if __name__ == '__main__':

@@ -107,7 +107,7 @@ class DepressionLossSmoothCos(torch.nn.Module):
         target = target.long()
         phq8_pred, phq8_tar = input[:, 0], target[:, 0]
         binary_pred, binary_tar = input[:, 1:3], target[:, 1]
-        return 0.4 * self.score_loss(phq8_pred, phq8_tar) + self.cos_loss(
+        return self.score_loss(phq8_pred, phq8_tar) + self.cos_loss(
             binary_pred, binary_tar)
 
 
