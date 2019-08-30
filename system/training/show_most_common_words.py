@@ -49,7 +49,9 @@ def forward_model(model, x, pooling):
 
 def show_most_common(experiment_path: str,
                      max_heigth: float = 0.8,
-                     filterlen: int = 0):
+                     filterlen: int = 0,
+                     shift:int = 0):
+
     config = torch.load(glob.glob("{}/run_config*".format(experiment_path))[0],
                         map_location=lambda storage, loc: storage)
     model = torch.load(glob.glob("{}/run_model*".format(experiment_path))[0],
@@ -70,6 +72,7 @@ def show_most_common(experiment_path: str,
         for k, v in kaldi_io.read_mat_ark(data):
             v = scaler.transform(v)
             cur_transcripts = transcripts[int(k)]
+            v = np.roll(v, shift, axis=0) # Shifting by n sentences
             v = torch.from_numpy(v).unsqueeze(0).float().to(device)
             output, weights = forward_model(model, v, poolingfunction)
             output, weights = output.squeeze().cpu(), weights.squeeze().cpu(
