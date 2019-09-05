@@ -73,14 +73,9 @@ The main script of this repo is `run.py`.
 The code is centered around the config files placed at `config/`. Each parameter in these files can be modified for each run using google-fire e.g., if one opts to run a different model, just pass `--model GRU`. 
 
 `run.py` the following options ( ran as `python run.py OPTION`):
-* `train`: Trains a model given a config file (default is `config/text_lstm_deep.yaml`)
-* `stats`: Prints the evaluation results on the development set
-* `trainstats`: Convenience function to run train and evaluate in one.
-* `search`: Parameter search for learning rate, momentum and nesterov (SGD)
-* `searchadam`: Learning rate search for adam optimizer
-* `ex`: Extracts features from a given network (not finished),
-* `fwd`: Debugging function to forward some features through a network
-* `fuse`: Fusion of two models or more. Fusion is done by averaging each output.
+* `train`: Trains a model given a config file (default is `config/text_lstm_deep.yaml`).
+* `evaluate`: Evaluates a given trained model directory. Just pass the result of `train` to it.
+* `evaluates`: Same as evaluate but runs multiple passed directories e.g., passed as glob (`experiment/*/*/*`), and returns an outputfile as well as a table report of the results. Useful for multiple runs with different seeds.
 
 ## Notes
 
