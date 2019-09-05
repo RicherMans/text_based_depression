@@ -18,7 +18,6 @@ class ListDataset(torch.utils.data.Dataset):
     Arguments:
         *lists (List): List that have the same size of the first dimension.
     """
-
     def __init__(self, *lists):
         assert all(len(lists[0]) == len(a_list) for a_list in lists)
         self.lists = lists
@@ -30,38 +29,32 @@ class ListDataset(torch.utils.data.Dataset):
         return len(self.lists[0])
 
 
-def seq_collate_fn(data_batches):
-    """seq_collate_fn
-
-    Helper function for torch.utils.data.Dataloader
-
-    :param data_batches: iterateable
-    """
-    data_batches.sort(key=lambda x: len(x[0]), reverse=True)
-
-    def merge_seq(dataseq, dim=0):
-        lengths = [seq.shape for seq in dataseq]
-        # Assuming duration is given in the first dimension of each sequence
-        maxlengths = tuple(np.max(lengths, axis=dim))
-
-        # For the case that the lenthts are 2dimensional
-        lengths = np.array(lengths)[:, dim]
-        # batch_mean = np.mean(np.concatenate(dataseq),axis=0, keepdims=True)
-        # padded = np.tile(batch_mean, (len(dataseq), maxlengths[0], 1))
-        padded = np.zeros((len(dataseq),) + maxlengths)
-        for i, seq in enumerate(dataseq):
-            end = lengths[i]
-            padded[i, :end] = seq[:end]
-        return padded, lengths
-    features, targets = zip(*data_batches)
-    features_seq, feature_lengths = merge_seq(features)
-    return torch.from_numpy(features_seq), torch.tensor(targets)
+def pad(tensorlist, batch_first=True, padding_value=0.):
+    # In case we have 3d tensor in each element, squeeze the first dim (usually 1)
+    if len(tensorlist[0].shape) == 3:
+        tensorlist = [ten.squeeze() for ten in tensorlist]
+    # In case of len == 1 padding will throw an error
+    if len(tensorlist) == 1:
+        return torch.as_tensor(tensorlist)
+    tensorlist = [torch.as_tensor(item) for item in tensorlist]
+    return torch.nn.utils.rnn.pad_sequence(tensorlist,
+                                           batch_first=batch_first,
+                                           padding_value=padding_value)
 
 
-def create_dataloader(
-        kaldi_string, label_dict, transform=None,
-        batch_size: int = 16, num_workers: int = 1, shuffle: bool = True
-):
+def sequential_collate(batches):
+    # sort length wise
+    batches.sort(key=lambda x: len(x), reverse=True)
+    features, targets = zip(*batches)
+    return pad(features), torch.as_tensor(targets)
+
+
+def create_dataloader(kaldi_string,
+                      label_dict,
+                      transform=None,
+                      batch_size: int = 16,
+                      num_workers: int = 1,
+                      shuffle: bool = True):
     """create_dataloader
 
     :param kaldi_string: copy-feats input
@@ -83,7 +76,8 @@ def create_dataloader(
     features = []
     labels = []
     # Directly filter out all utterances without labels
-    for idx, (k, feat) in enumerate(filter(valid_feat, kaldi_io.read_mat_ark(kaldi_string))):
+    for idx, (k, feat) in enumerate(
+            filter(valid_feat, kaldi_io.read_mat_ark(kaldi_string))):
         if transform:
             feat = transform(feat)
         features.append(feat)
@@ -91,17 +85,21 @@ def create_dataloader(
     assert len(features) > 0, "No features were found, are the labels correct?"
     # Shuffling means that this is training dataset, so oversample
     if shuffle:
-        random_oversampler = RandomOverSampler(random_state=0)
+        sampler = RandomOverSampler()
         # Assume that label is Score, Binary, we take the binary to oversample
         sample_index = 1 if len(labels[0]) == 2 else 0
         # Dummy X data, y is the binary label
-        _, _ = random_oversampler.fit_resample(
-            torch.ones(len(features), 1), [l[sample_index] for l in labels])
+        _, _ = sampler.fit_resample(torch.ones(len(features), 1),
+                                    [l[sample_index] for l in labels])
         # Get the indices for the sampled data
-        indicies = random_oversampler.sample_indices_
+        indicies = sampler.sample_indices_
         # reindex, new data is oversampled in the minority class
-        features, labels = [features[id]
-                            for id in indicies], [labels[id] for id in indicies]
+        features, labels = [features[id] for id in indicies
+                            ], [labels[id] for id in indicies]
     dataset = ListDataset(features, labels)
     # Configure weights to reduce number of unseen utterances
-    return data.DataLoader(dataset, batch_size=batch_size, num_workers=num_workers, collate_fn=seq_collate_fn, shuffle=shuffle)
+    return data.DataLoader(dataset,
+                           batch_size=batch_size,
+                           num_workers=num_workers,
+                           collate_fn=sequential_collate,
+                           shuffle=shuffle)
