@@ -22,7 +22,7 @@ import sys
 from ignite.contrib.handlers import ProgressBar
 from ignite.engine import (Engine, Events)
 from ignite.handlers import EarlyStopping, ModelCheckpoint
-from ignite.metrics import Accuracy, Loss, RunningAverage, ConfusionMatrix, MeanAbsoluteError, Precision, Recall
+from ignite.metrics import Loss, RunningAverage, ConfusionMatrix, MeanAbsoluteError, Precision, Recall
 from ignite.contrib.handlers.param_scheduler import LRScheduler
 from torch.optim.lr_scheduler import StepLR
 
@@ -98,7 +98,7 @@ class Runner(object):
         dev_label_df.index = dev_label_df.index.astype(str)
         # target_type = ('PHQ8_Score', 'PHQ8_Binary')
         target_type = ('PHQ8_Score', 'PHQ8_Binary')
-        n_labels = 3  # PHQ8 (1) + Cross_entropy  (2)
+        n_labels = len(target_type)  # PHQ8 + Binary
         # Scores and their respective PHQ8
         train_labels = train_label_df.loc[:, target_type].T.apply(
             tuple).to_dict()
@@ -135,7 +135,8 @@ class Runner(object):
             losses,
             config_parameters['loss'])(**config_parameters['loss_args'])
         optimizer = getattr(torch.optim, config_parameters['optimizer'])(
-            model.parameters(), **config_parameters['optimizer_args'])
+            list(model.parameters()) + list(criterion.parameters()),
+            **config_parameters['optimizer_args'])
         poolingfunction = parse_poolingfunction(
             config_parameters['poolingfunction'])
         criterion = criterion.to(device)
@@ -159,9 +160,9 @@ class Runner(object):
 
         def meter_transform(output):
             y_pred, y = output
-            # y_pred is of shape [Bx3] (0 = MSE, 1+2 = Xent)
-            # y = is of shape [Bx2] (0=Mse, 1 = Xent)
-            return y_pred[:, 1:3], y[:, 1].long()
+            # y_pred is of shape [Bx2] (0 = MSE, 1 = BCE)
+            # y = is of shape [Bx2] (0=Mse, 1 = BCE)
+            return torch.sigmoid(y_pred[:, 1]).round(), y[:, 1].long()
 
         precision = Precision(output_transform=meter_transform, average=False)
         recall = Recall(output_transform=meter_transform, average=False)
@@ -169,8 +170,6 @@ class Runner(object):
         metrics = {
             'Loss':
             Loss(criterion),
-            'Accuracy':
-            Accuracy(output_transform=meter_transform),
             'Recall':
             Recall(output_transform=meter_transform, average=True),
             'Precision':
@@ -218,7 +217,6 @@ class Runner(object):
                 validation_string_list.append("{}: {:<5.2f}".format(
                     metric, inference_engine.state.metrics[metric]))
             logger.info(" ".join(validation_string_list))
-            logger.info("\n")
 
             pbar.n = pbar.last_print_n = 0
 
@@ -269,7 +267,7 @@ class Runner(object):
                                        dev_labels,
                                        transform=scaler.transform,
                                        batch_size=1,
-                                       num_workers=2,
+                                       num_workers=1,
                                        shuffle=False)
 
         model = model.to(device).eval()
@@ -279,7 +277,7 @@ class Runner(object):
                 y_score_pred.append(output[:, 0].cpu().numpy())
                 y_score_true.append(target[:, 0].cpu().numpy())
                 y_binary_pred.append(
-                    torch.argmax(output[:, 1:3], dim=1).cpu().numpy())
+                    torch.sigmoid(output[:, 1]).round().cpu().numpy())
                 y_binary_true.append(target[:, 1].cpu().numpy())
         y_score_true = np.concatenate(y_score_true)
         y_score_pred = np.concatenate(y_score_pred)
@@ -314,54 +312,31 @@ class Runner(object):
             self,
             *experiment_paths: str,
             outputfile: str = 'scores.csv',
-            num_workers: int = 2,
     ):
         result_dfs = []
         for exp_path in experiment_paths:
             print("Evaluating {}".format(exp_path))
-            result_df = self.evaluate(exp_path)
-            exp_config = torch.load(glob.glob(
-                "{}/run_config*".format(exp_path))[0],
-                                    map_location=lambda storage, loc: storage)
-            result_df['exp'] = os.path.basename(exp_path)
-            result_df['model'] = exp_config['model']
-            result_df['optimizer'] = exp_config['optimizer']
-            result_df['batch_size'] = exp_config['dataloader_args'][
-                'batch_size']
-            result_df['poolingfunction'] = exp_config['poolingfunction']
-            result_df['loss'] = exp_config['loss']
-            result_dfs.append(result_df)
+            try:
+                result_df = self.evaluate(exp_path)
+                exp_config = torch.load(
+                    glob.glob("{}/run_config*".format(exp_path))[0],
+                    map_location=lambda storage, loc: storage)
+                result_df['exp'] = os.path.basename(exp_path)
+                result_df['model'] = exp_config['model']
+                result_df['optimizer'] = exp_config['optimizer']
+                result_df['batch_size'] = exp_config['dataloader_args'][
+                    'batch_size']
+                result_df['poolingfunction'] = exp_config['poolingfunction']
+                result_df['loss'] = exp_config['loss']
+                result_dfs.append(result_df)
+            except Exception as e:  #Sometimes EOFError happens
+                pass
         df = pd.concat(result_dfs)
         df.sort_values(by='F1', ascending=False, inplace=True)
 
         with open(outputfile, 'w') as wp:
             df.to_csv(wp, index=False)
             print(tabulate(df, headers='keys', tablefmt="pipe"))
-
-    def check_dataloader(self, config, **kwargs):
-        config_parameters = parse_config_or_kwargs(config, **kwargs)
-        train_label_df = pd.read_csv(
-            config_parameters['trainlabels']).set_index('Participant_ID')
-        train_label_df.index = train_label_df.index.astype(str)
-        # target_type = ('PHQ8_Score', 'PHQ8_Binary')
-        target_type = ('PHQ8_Score', 'PHQ8_Binary')
-        # Scores and their respective PHQ8
-        train_labels = train_label_df.loc[:, target_type].T.apply(
-            tuple).to_dict()
-        train_kaldi_string = parsecopyfeats(
-            config_parameters['trainfeatures'],
-            **config_parameters['feature_args'])
-        train_dataloader = create_dataloader(
-            train_kaldi_string,
-            train_labels,
-            transform=lambda x: x,
-            shuffle=True,
-            **config_parameters['dataloader_args'])
-        stat = []
-        for a, b in train_dataloader:
-            stat.append(b.squeeze())
-        stat = torch.stack(stat).numpy()
-        print(np.unique(stat, return_counts=True, axis=0))
 
 
 def parsecopyfeats(feat, cmvn=False, delta=False, splice=None):
@@ -439,4 +414,3 @@ def parse_poolingfunction(poolingfunction_name='mean'):
 
 if __name__ == '__main__':
     fire.Fire(Runner)
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                

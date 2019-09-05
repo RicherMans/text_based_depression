@@ -139,6 +139,45 @@ class GRUAttn(torch.nn.Module):
         return self.outputlayer(x)
 
 
+class LSTMDualAttn(torch.nn.Module):
+    """LSTMSimpleAttn class for Depression detection"""
+    def __init__(self, inputdim: int, output_size: int, **kwargs):
+        """
+
+        :inputdim:int: Input dimension
+        :output_size:int: Output dimension of LSTMSimpleAttn
+        :**kwargs: Other args, passed down to nn.LSTMSimpleAttn
+
+
+        """
+        torch.nn.Module.__init__(self)
+        kwargs.setdefault('hidden_size', 128)
+        kwargs.setdefault('num_layers', 3)
+        kwargs.setdefault('bidirectional', True)
+        kwargs.setdefault('dropout', 0.2)
+        self.lstm = nn.LSTM(inputdim, **kwargs)
+        init_rnn(self.lstm)
+        self.outputlayer = nn.Linear(kwargs['hidden_size'] * 2, output_size)
+        nn.init.kaiming_normal_(self.outputlayer.weight)
+        self.attn = nn.Linear(kwargs['hidden_size'] * 2, output_size)
+        nn.init.kaiming_normal_(self.outputlayer.weight)
+        # self.mae_attn = SimpleAttention(kwargs['hidden_size'] * 2, 1)
+        # self.bin_attn = SimpleAttention(kwargs['hidden_size'] * 2, 1)
+
+    def forward(self, x):
+        """Forwards input vector through network
+
+        :x: input tensor of shape (B, T, D) [Batch, Time, Dim]
+        :returns: TODO
+
+        """
+        x, _ = self.lstm(x)
+        out = self.outputlayer(x)
+        time_attn = torch.softmax(self.attn(x), dim=1)
+        pooled = (time_attn * out).sum(dim=1).unsqueeze(1)
+        return pooled
+
+
 class LSTMAttn(torch.nn.Module):
     """LSTMSimpleAttn class for Depression detection"""
     def __init__(self, inputdim: int, output_size: int, **kwargs):
@@ -175,55 +214,9 @@ class LSTMAttn(torch.nn.Module):
         return self.attn(x)[1] * x
 
 
-class LSTMSelfAttn(nn.Module):
-    """docstring for LSTMSelfAttn"""
-    def __init__(self, inputdim, output_size, **kwargs):
-        super(LSTMSelfAttn, self).__init__()
-        self.inputdim, output_size, = inputdim, output_size
-        kwargs.setdefault('hidden_size', 128)
-        kwargs.setdefault('num_layers', 4)
-        kwargs.setdefault('bidirectional', True)
-        kwargs.setdefault('dropout', 0.1)
-        self.lstm = LSTM(inputdim, output_size, **kwargs)
-        init_rnn(self.lstm)
-        self.attn = SelfAttention()
-
-    def forward(self, x):
-        """Forwards input vector through network
-
-        :x: input tensor of shape (B, T, D) [Batch, Time, Dim]
-        :returns: TODO
-
-        """
-        out, hid = self.lstm.net(x)
-        hid = hid[1]
-        # Bidirectional
-        hid = torch.cat([hid[-1], hid[-2]], dim=1)
-        # 0 for LSTM
-        energy, out = self.attn(hid, out, out)
-        out = out.unsqueeze(1)
-        return self.lstm.outputlayer(out)
-
-
-class SelfAttention(nn.Module):
-    """docstring for SelfAttention"""
-    def __init__(self):
-        super(SelfAttention, self).__init__()
-
-    def forward(self, query, keys, values):
-        query = query.unsqueeze(1)
-        keys = keys.transpose(1, 2)  # [BxTxK] --> [BxKxT]
-        energy = torch.bmm(query, keys)  # [Bx1xT]
-        energy = torch.softmax(energy.mul_(1. / math.sqrt(query.shape[-1])),
-                               dim=-1)
-
-        comb = torch.bmm(energy, values).squeeze(1)  # [BxV]
-        return energy, comb
-
-
 class SimpleAttention(nn.Module):
     """Docstring for SimpleAttention. """
-    def __init__(self, inputdim):
+    def __init__(self, inputdim, outputdim=1):
         """TODO: to be defined1.
 
         :inputdim: TODO
@@ -232,10 +225,10 @@ class SimpleAttention(nn.Module):
         nn.Module.__init__(self)
 
         self._inputdim = inputdim
-        self.attn = nn.Linear(inputdim, 1, bias=False)
-        nn.init.kaiming_normal_(self.attn.weight)
+        self.attn = nn.Linear(inputdim, outputdim, bias=False)
+        nn.init.normal_(self.attn.weight, std=0.05)
 
     def forward(self, x):
         weights = torch.softmax(self.attn(x), dim=1)
-        out = torch.bmm(weights.transpose(1, 2), torch.tanh(x))
+        out = (weights * x).sum(dim=1).unsqueeze(1)
         return out, weights

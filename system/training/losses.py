@@ -113,20 +113,30 @@ class DepressionLossSmoothCos(torch.nn.Module):
 
 class DepressionLossSmooth(torch.nn.Module):
     """Docstring for DepressionLoss. """
-    def __init__(self):
+    def __init__(self, reduction='sum'):
         """ """
         torch.nn.Module.__init__(self)
 
         self.score_loss = HuberLoss()
-        self.xent = CrossEntropyLoss()
+        self.bce = BCEWithLogitsLoss()
+        self.weight = torch.nn.Parameter(torch.tensor(0.))
+        self.reduction = reduction
+        self.eps = 0.01
 
     def forward(self, input, target):
-        target = target.long()
         phq8_pred, phq8_tar = input[:, 0], target[:, 0]
-        binary_pred, binary_tar = input[:, 1:3], target[:, 1]
-        score_loss, bin_loss = self.score_loss(phq8_pred, phq8_tar), self.xent(
+        binary_pred, binary_tar = input[:, 1], target[:, 1]
+        score_loss, bin_loss = self.score_loss(phq8_pred, phq8_tar), self.bce(
             binary_pred, binary_tar)
-        return score_loss + bin_loss
+        weight = torch.clamp(torch.sigmoid(self.weight),
+                             min=self.eps,
+                             max=1 - self.eps)
+        stacked_loss = (weight * score_loss) + ((1 - weight) * bin_loss)
+        if self.reduction == 'mean':
+            stacked_loss = stacked_loss.mean()
+        elif self.reduction == 'sum':
+            stacked_loss = stacked_loss.sum()
+        return stacked_loss
 
 
 class BCEWithLogitsLoss(torch.nn.Module):

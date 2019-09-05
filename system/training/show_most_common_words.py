@@ -95,6 +95,8 @@ def show_most_common(experiment_path: str,
                     model_thinks_depression > 0.5
                 })
 
+    if not all_words:
+        raise ValueError("Nothing found for the specified peak limit, maybe lower --max_height ?")
     df = pd.DataFrame(all_words)
     # aggregate = df.groupby('sent', as_index=False).agg(
     # ['count', 'mean'])
