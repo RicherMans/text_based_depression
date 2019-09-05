@@ -8,24 +8,27 @@ Source code for the paper [Text-based Depression Detection: What Triggers An Ale
 The required python packages can be found in `requirements.txt`.
 
 ```
-tqdm==4.24.0
-allennlp==0.8.2
-tableprint==0.8.0
-tabulate==0.8.2
-fire==0.1.3
-nltk==3.3
+torch==1.2.0
 kaldi_io==0.9.1
-scipy==1.2.1
-torchnet==0.0.4
-pandas==0.24.1
-numpy==1.16.2
-bert_serving_client==1.8.3
-imbalanced_learn==0.4.3
-torch==0.4.1.post2
-gensim==3.7.1
+bert_serving_server==1.9.6
+pytorch_ignite==0.2.0
+numpy==1.16.4
+librosa==0.7.0
+tabulate==0.8.3
+mistletoe==0.7.2
+scipy==1.3.0
+tqdm==4.32.2
+pandas==0.24.2
+fire==0.1.3
+imbalanced_learn==0.5.0
+allennlp==0.8.5
+gensim==3.8.0
+ignite==1.1.0
 imblearn==0.0
-scikit_learn==0.20.3
-PyYAML==5.1
+nltk==3.4.5
+plotnine==0.6.0
+scikit_learn==0.21.3
+PyYAML==5.1.2
 ```
 
 
