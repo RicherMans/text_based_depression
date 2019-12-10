@@ -31,6 +31,10 @@ scikit_learn==0.21.3
 PyYAML==5.1.2
 ```
 
+## Pretrained models
+
+Pretrained models from the paper are available at [The release page](https://github.com/RicherMans/text_based_depression/releases).
+
 
 ## Dataset 
 
