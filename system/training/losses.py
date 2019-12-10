@@ -119,19 +119,16 @@ class DepressionLossSmooth(torch.nn.Module):
 
         self.score_loss = HuberLoss()
         self.bce = BCEWithLogitsLoss()
-        self.weight = torch.nn.Parameter(torch.tensor(0.))
+        self.weight = 0.1
         self.reduction = reduction
-        self.eps = 0.01
 
     def forward(self, input, target):
         phq8_pred, phq8_tar = input[:, 0], target[:, 0]
         binary_pred, binary_tar = input[:, 1], target[:, 1]
         score_loss, bin_loss = self.score_loss(phq8_pred, phq8_tar), self.bce(
             binary_pred, binary_tar)
-        weight = torch.clamp(torch.sigmoid(self.weight),
-                             min=self.eps,
-                             max=1 - self.eps)
-        stacked_loss = (weight * score_loss) + ((1 - weight) * bin_loss)
+        stacked_loss = (self.weight * score_loss) + (
+            (1 - self.weight) * bin_loss)
         if self.reduction == 'mean':
             stacked_loss = stacked_loss.mean()
         elif self.reduction == 'sum':

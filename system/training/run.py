@@ -24,7 +24,6 @@ from ignite.engine import (Engine, Events)
 from ignite.handlers import EarlyStopping, ModelCheckpoint
 from ignite.metrics import Loss, RunningAverage, ConfusionMatrix, MeanAbsoluteError, Precision, Recall
 from ignite.contrib.handlers.param_scheduler import LRScheduler
-from torch.optim.lr_scheduler import StepLR
 
 device = 'cpu'
 if torch.cuda.is_available(
